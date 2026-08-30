@@ -553,6 +553,16 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
+    # A caller may reuse a task id across requests. Prepared synthesis is valid
+    # only for the exact request that produced its deterministic evidence.
+    try:
+        from agent.skill_lifecycle import get_prepared_synthesis
+        get_prepared_synthesis(effective_task_id, user_message if isinstance(user_message, str) else "")
+    except Exception:
+        logger.debug("prepared-synthesis task reset failed", exc_info=True)
+    # Available to deterministic local tool routing without injecting another
+    # model message or mutating earlier conversation context.
+    agent._current_user_task = user_message if isinstance(user_message, str) else ""
     turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
     if not turn_id:
         turn_id = (

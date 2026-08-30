@@ -2436,6 +2436,18 @@ def run_conversation(
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
 
+        # A READY preparation handoff is a request-local phase: keep the
+        # transcript and stable system prompt untouched, replace only the
+        # owning skill_view result on this API copy, and expose no model tools.
+        from agent.skill_lifecycle import (
+            get_prepared_synthesis,
+            install_synthesis_handoff,
+            tools_for_synthesis,
+        )
+        _synthesis_state = get_prepared_synthesis(effective_task_id, user_message)
+        if _synthesis_state:
+            install_synthesis_handoff(api_messages, _synthesis_state)
+
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects
         # as empty" is ``repair_empty_non_final_messages``, which runs inside
@@ -2461,7 +2473,7 @@ def run_conversation(
         # exactly the point the breakpoints were meant to protect. Marking
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
-        tools_for_api = agent.tools
+        tools_for_api = tools_for_synthesis(_synthesis_state, agent.tools)
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2515,7 +2527,7 @@ def run_conversation(
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(tools_for_api) if tools_for_api else 0
         )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
@@ -2998,7 +3010,7 @@ def run_conversation(
                             else [],
                             system_prompt=system_prompt_for_hooks,
                             message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
+                            tool_count=len(tools_for_api or []),
                             approx_input_tokens=approx_tokens,
                             request_char_count=total_chars,
                             max_tokens=agent.max_tokens,
@@ -3055,6 +3067,12 @@ def run_conversation(
                         agent.thinking_callback("")
 
                 _use_streaming = True
+                try:
+                    from agent.skill_finalization import has_required_finalizer
+                    if has_required_finalizer(effective_task_id):
+                        _use_streaming = False
+                except Exception:
+                    logger.debug("skill finalization streaming gate failed", exc_info=True)
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
@@ -6913,6 +6931,14 @@ def run_conversation(
                 agent._codex_incomplete_retries = 0
             
             # Check for tool calls
+            # A provider can still return a stale/invalid tool call despite an
+            # empty schema. Treat it as malformed synthesis content and route
+            # directly to the required fail-closed finalizer; never reopen the
+            # ordinary dispatcher or retry loop for this task.
+            if _synthesis_state and assistant_message.tool_calls:
+                assistant_message.tool_calls = []
+                finish_reason = "stop"
+
             if assistant_message.tool_calls:
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
@@ -7555,7 +7581,7 @@ def run_conversation(
                 # an empty tool_calls array — is handled at the finalization
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
-                final_response = assistant_message.content or ""
+                final_response = assistant_message.content or ("{}" if _synthesis_state else "")
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
@@ -7974,7 +8000,8 @@ def run_conversation(
                 # alternation-safe interim-assistant + user-nudge mechanism —
                 # not a new parallel one — carries the recovery.
                 _stall_continue_intent = (
-                    bool(getattr(agent, "_stall_guards", True))
+                    not _synthesis_state
+                    and bool(getattr(agent, "_stall_guards", True))
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
                     and trailing_continue_intent(
@@ -7982,6 +8009,8 @@ def run_conversation(
                     )
                 )
                 if _stall_continue_intent or (
+                    not _synthesis_state
+                    and
                     _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
@@ -8028,8 +8057,26 @@ def run_conversation(
                             _frag.pop("_length_continuation_nudge", None)
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                try:
+                    from agent.skill_finalization import finalize_skill_response
+                    _skill_finalized = finalize_skill_response(
+                        effective_task_id, final_response, messages
+                    )
+                    if _skill_finalized.get("status") != "not_required":
+                        final_response = _skill_finalized["content"]
+                        agent._response_was_previewed = False
+                        from agent.skill_lifecycle import clear_prepared_synthesis
+                        clear_prepared_synthesis(effective_task_id)
+                except Exception:
+                    logger.exception("required skill finalization failed")
+                    final_response = (
+                        "I can’t safely finalize this response because its required "
+                        "deterministic validator failed."
+                    )
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                final_msg["content"] = final_response
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5

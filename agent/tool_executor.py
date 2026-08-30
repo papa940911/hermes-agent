@@ -2484,6 +2484,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
+                            user_task=getattr(agent, "_current_user_task", "") or "",
                             enabled_tools=(
                                 list(agent.valid_tool_names)
                                 if agent.valid_tool_names
@@ -2566,6 +2567,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
+                            user_task=getattr(agent, "_current_user_task", "") or "",
                             enabled_tools=(
                                 list(agent.valid_tool_names)
                                 if agent.valid_tool_names

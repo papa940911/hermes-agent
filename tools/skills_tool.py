@@ -1069,6 +1069,162 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
     return linked or None
 
 
+def _matching_capability_dependencies(
+    frontmatter: Dict[str, Any], user_task: str | None
+) -> List[Dict[str, Any]]:
+    """Return request-scoped mandatory dependencies without an LLM call.
+
+    ``related_skills`` remains descriptive. Mandatory dependencies use the
+    separate ``metadata.hermes.capability_dependencies`` declaration.
+    """
+    metadata = frontmatter.get("metadata")
+    hermes_meta = metadata.get("hermes", {}) if isinstance(metadata, dict) else {}
+    declarations = hermes_meta.get("capability_dependencies", [])
+    if not isinstance(declarations, list) or not isinstance(user_task, str):
+        return []
+    normalized_task = user_task.casefold()
+    matched: List[Dict[str, Any]] = []
+    for declaration in declarations:
+        if not isinstance(declaration, dict):
+            continue
+        when = declaration.get("when", {})
+        if not isinstance(when, dict):
+            continue
+        any_terms = when.get("any_terms", [])
+        all_terms = when.get("all_terms", [])
+        if isinstance(any_terms, str):
+            any_terms = [any_terms]
+        if isinstance(all_terms, str):
+            all_terms = [all_terms]
+        any_terms = [str(term).casefold() for term in any_terms if str(term).strip()]
+        all_terms = [str(term).casefold() for term in all_terms if str(term).strip()]
+        if (
+            (not any_terms or any(term in normalized_task for term in any_terms))
+            and all(term in normalized_task for term in all_terms)
+        ):
+            matched.append(declaration)
+    return matched
+
+
+def _extract_markdown_sections(
+    content: str, section_ids: List[str]
+) -> List[Dict[str, str]]:
+    """Extract declared ``## <ID>`` sections, retaining provenance text."""
+    if not section_ids:
+        return [{"identity": "complete-reference", "content": content}]
+    wanted = {str(section_id) for section_id in section_ids}
+    headings = list(re.finditer(r"(?m)^##\s+([^\s—]+).*?$", content))
+    extracted: List[Dict[str, str]] = []
+    for index, match in enumerate(headings):
+        identity = match.group(1).strip()
+        if identity not in wanted:
+            continue
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        extracted.append(
+            {"identity": identity, "content": content[match.start():end].strip()}
+        )
+    return extracted
+
+
+def _load_capability_dependencies(
+    frontmatter: Dict[str, Any], *, user_task: str | None, task_id: str | None
+) -> List[Dict[str, Any]]:
+    """Load compact, provenance-labelled dependency material for synthesis."""
+    results: List[Dict[str, Any]] = []
+    for declaration in _matching_capability_dependencies(frontmatter, user_task):
+        capability = str(declaration.get("capability") or "unknown")
+        dependency = declaration.get("requires", {})
+        if not isinstance(dependency, dict):
+            dependency = {}
+        owner = str(dependency.get("skill") or "")
+        reference = str(dependency.get("reference") or "")
+        section_ids = dependency.get("sections", [])
+        if isinstance(section_ids, str):
+            section_ids = [section_ids]
+        base = {
+            "capability": capability,
+            "owning_skill": owner or None,
+            "reference": reference or None,
+        }
+        if not owner or not reference:
+            results.append({
+                **base,
+                "status": "unavailable",
+                "error": "Dependency declaration requires both skill and reference.",
+                "synthesis_requirement": (
+                    "Do not substitute model memory. Limit the answer and disclose "
+                    f"that capability '{capability}' is unavailable."
+                ),
+            })
+            continue
+        try:
+            loaded = json.loads(
+                skill_view(
+                    owner,
+                    file_path=reference,
+                    task_id=task_id,
+                    preprocess=False,
+                )
+            )
+        except Exception as exc:
+            loaded = {"success": False, "error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(loaded, dict) or not loaded.get("success"):
+            error = (
+                loaded.get("error", "Dependency load failed")
+                if isinstance(loaded, dict)
+                else "Dependency load failed"
+            )
+            results.append({
+                **base,
+                "status": "unavailable",
+                "error": str(error),
+                "synthesis_requirement": (
+                    "Do not substitute model memory. Limit the answer and disclose "
+                    f"that capability '{capability}' is unavailable."
+                ),
+            })
+            continue
+        sections = _extract_markdown_sections(
+            str(loaded.get("content") or ""), list(section_ids)
+        )
+        found = {item["identity"] for item in sections}
+        missing = [section_id for section_id in section_ids if section_id not in found]
+        if missing:
+            results.append({
+                **base,
+                "status": "unavailable",
+                "error": (
+                    "Declared reference sections not found: "
+                    + ", ".join(map(str, missing))
+                ),
+                "synthesis_requirement": (
+                    "Do not substitute model memory. Limit the answer and disclose "
+                    f"that capability '{capability}' is unavailable."
+                ),
+            })
+            continue
+        results.append({
+            **base,
+            "status": "available",
+            "principles": sections,
+            "synthesis_requirement": (
+                "Use only these loaded source-backed principles for this capability; "
+                "preserve each principle's scope and limitations. This reference and "
+                "the declared sections are already loaded and are the authoritative "
+                "dependency payload; do not skill_view or read them again merely to "
+                "duplicate the same content. Targeted expansion remains permitted "
+                "for a principle section not declared in this payload."
+            ),
+            "reuse": {
+                "status": "already_loaded",
+                "authoritative_for_capability": True,
+                "duplicate_read_required": False,
+                "targeted_expansion_allowed": True,
+            },
+        })
+    return results
+
+
 def skill_view(
     name: str,
     file_path: str = None,
@@ -2041,7 +2197,9 @@ def _skill_view_fingerprint(payload: dict) -> tuple | None:
         return None
 
 
-def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
+def _record_skill_view(
+    task_id, name, file_path, payload: dict, request_context: str = ""
+) -> None:
     """Record a served skill_view so an identical repeat can be deduped."""
     if not task_id:
         return
@@ -2053,7 +2211,11 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
     fp = _skill_view_fingerprint(payload)
     if fp is None:
         return
-    key = (str(payload.get("name") or name), file_path or "")
+    key = (
+        str(payload.get("name") or name),
+        file_path or "",
+        request_context or "",
+    )
     with _skill_view_tracker_lock:
         cache = _skill_view_tracker.setdefault(str(task_id), {})
         cache[key] = fp
@@ -2064,7 +2226,9 @@ def _record_skill_view(task_id, name, file_path, payload: dict) -> None:
                 break
 
 
-def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
+def _check_skill_view_dedup(
+    task_id, name, file_path, request_context: str = ""
+) -> str | None:
     """Return a dedup stub when this exact skill file was already served
     to this task and is unchanged on disk; None otherwise."""
     if not task_id:
@@ -2076,8 +2240,10 @@ def _check_skill_view_dedup(task_id, name, file_path) -> str | None:
         # The record key uses the RESOLVED name; check both the raw arg and
         # resolved forms so 'category/skill' and bare-name views coalesce.
         for key, (src, mtime_ns, size) in list(cache.items()):
-            rec_name, rec_fp = key
+            rec_name, rec_fp, rec_request = key
             if rec_fp != (file_path or ""):
+                continue
+            if rec_request != (request_context or ""):
                 continue
             if rec_name != str(name) and not str(name).endswith("/" + rec_name) \
                     and not rec_name.endswith("/" + str(name)) \
@@ -2117,6 +2283,13 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
             _skill_view_tracker.clear()
         else:
             _skill_view_tracker.pop(str(task_id), None)
+    try:
+        from agent.skill_finalization import clear_skill_finalizers
+        clear_skill_finalizers(task_id)
+        from agent.skill_lifecycle import clear_prepared_synthesis
+        clear_prepared_synthesis(task_id)
+    except Exception:
+        logger.debug("Could not clear skill lifecycle", exc_info=True)
 
 
 def _skill_view_with_bump(args, **kw):
@@ -2134,7 +2307,10 @@ def _skill_view_with_bump(args, **kw):
     # "skills must be loaded fully" rule is preserved — and the cache is
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
-    stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
+    request_context = str(kw.get("user_task") or "")
+    stub = _check_skill_view_dedup(
+        task_id, name, args.get("file_path"), request_context
+    )
     if stub is not None:
         return stub
     result = skill_view(
@@ -2143,7 +2319,109 @@ def _skill_view_with_bump(args, **kw):
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):
-            _record_skill_view(task_id, name, args.get("file_path"), parsed)
+            if not args.get("file_path"):
+                source_path = parsed.get("_source_path")
+                try:
+                    source_content = Path(source_path).read_text(
+                        encoding="utf-8-sig", errors="replace"
+                    )
+                    source_frontmatter, _ = _parse_frontmatter(source_content)
+                    dependencies = _load_capability_dependencies(
+                        source_frontmatter,
+                        user_task=kw.get("user_task"),
+                        task_id=task_id,
+                    )
+                    if dependencies:
+                        parsed["required_capability_dependencies"] = dependencies
+                        parsed["pre_synthesis_gate"] = {
+                            "status": (
+                                "ready"
+                                if all(
+                                    item.get("status") == "available"
+                                    for item in dependencies
+                                )
+                                else "limited"
+                            ),
+                            "instruction": (
+                                "Required dependency material is attached and available "
+                                "sections are already loaded; reuse them without manually "
+                                "loading the owning skill or reading the same reference. "
+                                "Targeted expansion outside the declared sections remains "
+                                "available. If any "
+                                "capability is unavailable, do not use model memory "
+                                "for it and make the limitation explicit in the final answer."
+                            ),
+                        }
+                        result = json.dumps(parsed, ensure_ascii=False)
+                except Exception as exc:
+                    # A malformed declaration must be visible to synthesis,
+                    # never silently degrade to model memory.
+                    parsed["required_capability_dependencies"] = [{
+                        "capability": "dependency_loading",
+                        "status": "unavailable",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "synthesis_requirement": (
+                            "Do not substitute model memory. Limit the answer and "
+                            "disclose that required dependency loading failed."
+                        ),
+                    }]
+                    parsed["pre_synthesis_gate"] = {
+                        "status": "limited",
+                        "instruction": (
+                            "Required dependency loading failed. Do not silently "
+                            "synthesize the affected capability from model memory."
+                        ),
+                    }
+                    result = json.dumps(parsed, ensure_ascii=False)
+                    logger.warning(
+                        "Capability dependency loading failed for skill %s: %s",
+                        name,
+                        exc,
+                        exc_info=True,
+                    )
+                try:
+                    from agent.skill_preparation import run_skill_preparation
+                    preparation = run_skill_preparation(
+                        parsed,
+                        user_task=request_context,
+                        task_id=task_id,
+                        capability_dependencies=parsed.get(
+                            "required_capability_dependencies", []
+                        ),
+                    )
+                    if preparation is not None:
+                        # The preparation context becomes the single runtime
+                        # evidence copy consumed by synthesis and finalization.
+                        if isinstance(preparation.get("context"), dict):
+                            parsed.pop("required_capability_dependencies", None)
+                        parsed["preparation"] = preparation
+                        parsed["preparation_status"] = (
+                            f"PREPARATION STATUS: {preparation['status']}"
+                        )
+                        result = json.dumps(parsed, ensure_ascii=False)
+                except Exception as exc:
+                    parsed["preparation"] = {
+                        "required": True,
+                        "status": "FAILED",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    parsed["preparation_status"] = "PREPARATION STATUS: FAILED"
+                    result = json.dumps(parsed, ensure_ascii=False)
+                    logger.warning("Skill preparation failed for %s", name, exc_info=True)
+                try:
+                    from agent.skill_finalization import register_skill_finalizer
+                    register_skill_finalizer(task_id, parsed)
+                    from agent.skill_lifecycle import register_prepared_synthesis
+                    register_prepared_synthesis(task_id, parsed, request_context)
+                except Exception:
+                    logger.warning("Could not register skill lifecycle for %s", name, exc_info=True)
+            _record_skill_view(
+                task_id,
+                name,
+                args.get("file_path"),
+                parsed,
+                request_context,
+            )
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
