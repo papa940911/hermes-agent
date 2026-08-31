@@ -688,18 +688,23 @@ class ChatCompletionsTransport(ProviderTransport):
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
 
-        # Merge any pre-built extra_body additions
+        # Request overrides preserve extra_body siblings instead of replacing
+        # the assembled provider body.
+        overrides = params.get("request_overrides")
+        if overrides:
+            for key, value in overrides.items():
+                if key == "extra_body" and isinstance(value, dict):
+                    extra_body.update(value)
+                else:
+                    api_kwargs[key] = value
+
+        # Request-local lifecycle additions are authoritative for this call.
         additions = params.get("extra_body_additions")
         if additions:
             extra_body.update(additions)
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
-
-        # Request overrides last (service_tier etc.)
-        overrides = params.get("request_overrides")
-        if overrides:
-            api_kwargs.update(overrides)
 
         _add_prompt_cache_key(
             api_kwargs,
@@ -827,11 +832,6 @@ class ChatCompletionsTransport(ProviderTransport):
         if extra_body_from_profile:
             extra_body.update(extra_body_from_profile)
 
-        # Merge any pre-built extra_body additions from the caller
-        additions = params.get("extra_body_additions")
-        if additions:
-            extra_body.update(additions)
-
         # Request overrides (user config)
         overrides = params.get("request_overrides")
         if overrides:
@@ -840,6 +840,11 @@ class ChatCompletionsTransport(ProviderTransport):
                     extra_body.update(v)
                 else:
                     api_kwargs[k] = v
+
+        # Request-local lifecycle additions are authoritative for this call.
+        additions = params.get("extra_body_additions")
+        if additions:
+            extra_body.update(additions)
 
         if extra_body:
             # Native Gemini (generativelanguage.googleapis.com, non-/openai)

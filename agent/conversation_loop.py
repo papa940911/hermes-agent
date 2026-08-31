@@ -1874,6 +1874,16 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Skill-declared owner routing runs after request/task identity exists but
+    # before the unrestricted provider loop. It activates through skill_view,
+    # so preparation, dependencies, and finalization keep their existing owners.
+    from agent.skill_routing import activate_routed_skill
+
+    _skill_route, _routed_skill_result = activate_routed_skill(
+        user_message, effective_task_id
+    )
+    agent._last_skill_route = _skill_route
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -2442,11 +2452,23 @@ def run_conversation(
         from agent.skill_lifecycle import (
             get_prepared_synthesis,
             install_synthesis_handoff,
+            synthesis_handoff_text,
             tools_for_synthesis,
+            structured_output_extra_body,
         )
         _synthesis_state = get_prepared_synthesis(effective_task_id, user_message)
         if _synthesis_state:
-            install_synthesis_handoff(api_messages, _synthesis_state)
+            if not install_synthesis_handoff(api_messages, _synthesis_state):
+                from agent.skill_routing import install_routed_context
+                install_routed_context(api_messages, synthesis_handoff_text(_synthesis_state))
+        elif _routed_skill_result is not None:
+            # LIMITED/FAILED activation remains visible to the ordinary loop;
+            # it does not receive the constrained tool surface.
+            from agent.skill_routing import install_routed_context
+            install_routed_context(
+                api_messages,
+                json.dumps(_routed_skill_result, ensure_ascii=False),
+            )
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects
@@ -2474,6 +2496,37 @@ def run_conversation(
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
         tools_for_api = tools_for_synthesis(_synthesis_state, agent.tools)
+        _synthesis_extra_body = structured_output_extra_body(_synthesis_state)
+        _structured_state = (
+            _synthesis_state.get("structured_output")
+            if isinstance(_synthesis_state, dict) else None
+        )
+        if (
+            isinstance(_structured_state, dict)
+            and _structured_state.get("required")
+            and not _synthesis_extra_body
+        ):
+            refusal = (
+                "I can’t safely finalize this response because required "
+                "structured-output enforcement is unavailable."
+            )
+            try:
+                from agent.skill_finalization import finalize_skill_response
+                finalize_skill_response(
+                    effective_task_id, "", messages,
+                    finish_reason=None, provider_transport_streaming=False)
+            except Exception:
+                logger.debug(
+                    "structured-output unavailable diagnostics failed",
+                    exc_info=True,
+                )
+            append_message(messages, {"role": "assistant", "content": refusal})
+            agent._persist_session(messages, conversation_history)
+            return {
+                "final_response": refusal, "messages": messages,
+                "api_calls": api_call_count, "completed": False,
+                "failed": True, "error": "required_structured_output_unavailable",
+            }
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2899,12 +2952,22 @@ def run_conversation(
                     )
                 )
                 if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                    if _synthesis_extra_body:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages, extra_body_additions=_synthesis_extra_body)
+                    else:
+                        api_kwargs = agent._build_api_kwargs(api_messages)
                 else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                    if _synthesis_extra_body:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages, tools_for_api=tools_for_api,
+                            extra_body_additions=_synthesis_extra_body)
+                    else:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages, tools_for_api=tools_for_api)
+                if _synthesis_extra_body:
+                    from agent.skill_lifecycle import mark_structured_output_status
+                    mark_structured_output_status(effective_task_id, sent=True)
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -3067,10 +3130,15 @@ def run_conversation(
                         agent.thinking_callback("")
 
                 _use_streaming = True
+                _buffer_provider_stream = False
                 try:
                     from agent.skill_finalization import has_required_finalizer
                     if has_required_finalizer(effective_task_id):
-                        _use_streaming = False
+                        # Keep the provider transport streaming so valid chunks
+                        # refresh its inactivity watchdog, but withhold every
+                        # delta until deterministic finalization validates the
+                        # complete response below.
+                        _buffer_provider_stream = True
                 except Exception:
                     logger.debug("skill finalization streaming gate failed", exc_info=True)
                 # Provider signaled "stream not supported" on a previous
@@ -3116,6 +3184,14 @@ def run_conversation(
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
+                        if _buffer_provider_stream:
+                            from agent.chat_completion_helpers import (
+                                suppress_provider_stream_delivery,
+                            )
+                            with suppress_provider_stream_delivery(agent):
+                                return agent._interruptible_streaming_api_call(
+                                    next_api_kwargs, on_first_delta=_stop_spinner
+                                )
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
@@ -4388,6 +4464,42 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                # Required structured synthesis is a one-call, fail-closed
+                # protocol. Never route its rejection through ordinary retry,
+                # fallback, or llama.cpp tool-schema grammar recovery.
+                if _synthesis_extra_body:
+                    from agent.auxiliary_client import _is_structured_output_rejection
+                    if _is_structured_output_rejection(api_error):
+                        from agent.skill_lifecycle import mark_structured_output_status
+                        mark_structured_output_status(
+                            effective_task_id, sent=True, provider_rejected=True)
+                        refusal = (
+                            "I can’t safely finalize this response because the provider "
+                            "rejected required structured-output enforcement."
+                        )
+                        # Run the already-required deterministic finalizer on
+                        # an empty candidate so opt-in diagnostics record the
+                        # request rejection without exposing provider text.
+                        try:
+                            from agent.skill_finalization import finalize_skill_response
+                            finalize_skill_response(
+                                effective_task_id, "", messages,
+                                finish_reason=None,
+                                provider_transport_streaming=True,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "structured-output rejection diagnostics failed",
+                                exc_info=True,
+                            )
+                        append_message(messages, {"role": "assistant", "content": refusal})
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": refusal, "messages": messages,
+                            "api_calls": api_call_count, "completed": False,
+                            "failed": True, "error": "required_structured_output_rejected",
+                        }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -8061,7 +8173,11 @@ def run_conversation(
                 try:
                     from agent.skill_finalization import finalize_skill_response
                     _skill_finalized = finalize_skill_response(
-                        effective_task_id, final_response, messages
+                        effective_task_id,
+                        final_response,
+                        messages,
+                        finish_reason=finish_reason,
+                        provider_transport_streaming=_use_streaming,
                     )
                     if _skill_finalized.get("status") != "not_required":
                         final_response = _skill_finalized["content"]

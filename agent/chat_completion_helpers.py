@@ -24,6 +24,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
@@ -49,6 +50,29 @@ from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def suppress_provider_stream_delivery(agent):
+    """Buffer provider streaming without publishing unvalidated deltas.
+
+    Required deterministic finalizers need the complete model response before
+    anything is user-visible, but the transport still needs streaming events
+    as evidence that a long request is alive.  The depth counter makes this
+    safe for nested wrappers and the ``finally`` prevents suppression leaking
+    into later, ordinary turns.
+    """
+    depth = int(getattr(agent, "_provider_stream_suppression_depth", 0) or 0)
+    agent._provider_stream_suppression_depth = depth + 1
+    try:
+        yield
+    finally:
+        agent._provider_stream_suppression_depth = depth
+
+
+def provider_stream_delivery_suppressed(agent) -> bool:
+    """Whether provider deltas are transport-only for the current call."""
+    return bool(getattr(agent, "_provider_stream_suppression_depth", 0))
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
@@ -1822,7 +1846,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None,
+                     extra_body_additions: dict | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -2060,6 +2085,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
+            extra_body_additions=extra_body_additions,
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -2108,6 +2134,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+        extra_body_additions=extra_body_additions,
     )
 
 
@@ -3438,7 +3465,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _bedrock_response_started["yes"] = True
                     _fire_first()
                     agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    if not provider_stream_delivery_suppressed(agent):
+                        deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
                     _bedrock_response_started["yes"] = True
@@ -4029,9 +4057,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 for text in pending_parts:
                     _fire_first_delta()
                     agent._fire_stream_delta(text)
-                    deltas_were_sent["yes"] = True
+                    if not provider_stream_delivery_suppressed(agent):
+                        deltas_were_sent["yes"] = True
                 return
-            if agent.stream_delta_callback:
+            if (
+                agent.stream_delta_callback
+                and not provider_stream_delivery_suppressed(agent)
+            ):
                 for text in pending_parts:
                     try:
                         agent.stream_delta_callback(text)
@@ -4157,7 +4189,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         continue
                     _fire_first_delta()
                     agent._fire_stream_delta(delta_content)
-                    deltas_were_sent["yes"] = True
+                    if not provider_stream_delivery_suppressed(agent):
+                        deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
                 # tool calls).  But reasoning tags embedded in suppressed
@@ -4169,7 +4202,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif (
+                    agent.stream_delta_callback
+                    and not provider_stream_delivery_suppressed(agent)
+                ):
                     try:
                         agent.stream_delta_callback(delta_content)
                         agent._record_streamed_assistant_text(delta_content)
@@ -4597,7 +4633,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             if text and not has_tool_use:
                                 _fire_first_delta()
                                 agent._fire_stream_delta(text)
-                                deltas_were_sent["yes"] = True
+                                if not provider_stream_delivery_suppressed(agent):
+                                    deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:

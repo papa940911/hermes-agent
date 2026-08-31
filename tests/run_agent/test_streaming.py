@@ -96,6 +96,97 @@ class TestStreamingAccumulator:
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
 
+    @pytest.mark.parametrize(
+        "parts",
+        [
+            list('{"path":"C:\\\\tmp","quote":"\\\"","unicode":"雪🌊"}'),
+            ['{"pa', 'th":"C:', '\\\\', 'tmp","quote":"', '\\"', '","unicode":"雪', '🌊"}'],
+            ['{', '"path"', ':"C:\\\\tmp",', '"quote":"\\\"",', '"unicode":"雪🌊"', '}'],
+        ],
+    )
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_candidate_reconstruction_is_exact_across_arbitrary_boundaries(
+        self, mock_close, mock_create, parts
+    ):
+        from run_agent import AIAgent
+
+        logical = '{"path":"C:\\\\tmp","quote":"\\\"","unicode":"雪🌊"}'
+        chunks = [_make_stream_chunk(content=part) for part in parts]
+        chunks[-1].choices[0].finish_reason = "stop"
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+        agent = AIAgent(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1",
+            model="test/model", quiet_mode=True, skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == logical
+        assert response.choices[0].message.reasoning_content is None
+        assert mock_client.chat.completions.create.call_count == 1
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_internal_stream_is_buffered_without_user_visible_deltas(
+        self, mock_close, mock_create
+    ):
+        """Finalized turns retain transport progress but publish no draft."""
+        from agent.chat_completion_helpers import suppress_provider_stream_delivery
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="unvalidated "),
+            _make_stream_chunk(content="manifest", finish_reason="stop"),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        visible = []
+        activity = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=visible.append,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._touch_activity = activity.append
+
+        with suppress_provider_stream_delivery(agent):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "unvalidated manifest"
+        assert visible == []
+        assert agent._current_streamed_assistant_text == ""
+        assert activity.count("receiving stream response") == len(chunks)
+        assert mock_client.chat.completions.create.call_count == 1
+        assert agent._provider_stream_suppression_depth == 0
+
+
+    def test_provider_stream_suppression_restores_after_error(self):
+        from agent.chat_completion_helpers import (
+            provider_stream_delivery_suppressed,
+            suppress_provider_stream_delivery,
+        )
+
+        agent = SimpleNamespace()
+        with pytest.raises(RuntimeError, match="boom"):
+            with suppress_provider_stream_delivery(agent):
+                assert provider_stream_delivery_suppressed(agent)
+                raise RuntimeError("boom")
+        assert not provider_stream_delivery_suppressed(agent)
+
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
     def test_sparse_delta_allows_missing_optional_fields(self, mock_close, mock_create):

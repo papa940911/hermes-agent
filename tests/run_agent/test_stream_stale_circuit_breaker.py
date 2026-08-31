@@ -152,3 +152,52 @@ class TestStreamStaleCircuitBreaker:
 
         # At least one stale kill happened; the streak must have advanced.
         assert agent._consecutive_stale_streams >= 1
+
+    def test_periodic_progress_allows_generation_longer_than_stale_interval(
+        self, monkeypatch
+    ):
+        """The stale budget measures chunk inactivity, not total duration."""
+        import time
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.12")
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        def _progressing_stream():
+            for index in range(8):
+                time.sleep(0.05)
+                yield SimpleNamespace(
+                    choices=[SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=str(index),
+                            tool_calls=None,
+                            reasoning_content=None,
+                            reasoning=None,
+                        ),
+                        finish_reason="stop" if index == 7 else None,
+                    )],
+                    model="test/model",
+                    usage=None,
+                )
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = _progressing_stream()
+        agent._create_request_openai_client = lambda *a, **k: client
+        agent._close_request_openai_client = lambda *a, **k: None
+
+        started = time.monotonic()
+        response = agent._interruptible_streaming_api_call({})
+
+        assert time.monotonic() - started > 0.12
+        assert response.choices[0].message.content == "01234567"
+        assert agent._consecutive_stale_streams == 0
+        assert client.chat.completions.create.call_count == 1

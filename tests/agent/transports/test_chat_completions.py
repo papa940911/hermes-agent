@@ -83,6 +83,34 @@ class TestChatCompletionsBasic:
             "{}",
         ]
 
+    def test_profile_merges_request_local_response_format_with_existing_fields(
+        self, transport
+    ):
+        class Profile:
+            fixed_temperature = None
+            supports_prompt_cache_key = False
+            def prepare_messages(self, messages): return messages
+            def get_max_tokens(self, model): return None
+            def build_api_kwargs_extras(self, **kwargs): return ({"thinking": {"type": "enabled"}}, {})
+            def build_extra_body(self, **kwargs): return {"profile_field": 1}
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {"name": "fixture", "strict": True,
+                            "schema": {"type": "object"}},
+        }
+        kwargs = transport.build_kwargs(
+            "model", [{"role": "user", "content": "hi"}], tools=[],
+            provider_profile=Profile(),
+            extra_body_additions={"response_format": response_format},
+            request_overrides={"extra_body": {"caller_field": 2, "response_format": "stale"}},
+        )
+        assert kwargs["extra_body"] == {
+            "profile_field": 1, "thinking": {"type": "enabled"},
+            "response_format": response_format, "caller_field": 2,
+        }
+        assert "tools" not in kwargs
+
     @pytest.mark.parametrize("provider", ["nous", "openrouter"])
     def test_gpt56_ultra_uses_max_wire_effort(self, transport, provider):
         from providers import get_provider_profile

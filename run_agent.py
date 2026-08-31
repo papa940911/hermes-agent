@@ -6902,6 +6902,9 @@ class AIAgent:
         }
 
     def _emit_stream_start(self) -> None:
+        from agent.chat_completion_helpers import provider_stream_delivery_suppressed
+        if provider_stream_delivery_suppressed(self):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6910,6 +6913,9 @@ class AIAgent:
             logger.debug("on_stream_start plugin hook enqueue failed", exc_info=True)
 
     def _emit_stream_end(self, *, final_text: str, finished: bool, error: str | None) -> None:
+        from agent.chat_completion_helpers import provider_stream_delivery_suppressed
+        if provider_stream_delivery_suppressed(self):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6925,6 +6931,9 @@ class AIAgent:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        from agent.chat_completion_helpers import provider_stream_delivery_suppressed
+        if provider_stream_delivery_suppressed(self):
+            return
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -6994,6 +7003,9 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        from agent.chat_completion_helpers import provider_stream_delivery_suppressed
+        if provider_stream_delivery_suppressed(self):
+            return
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
@@ -7026,6 +7038,9 @@ class AIAgent:
         or status line so the user isn't staring at a frozen screen while a
         large tool payload (e.g. a 45 KB write_file) is being generated.
         """
+        from agent.chat_completion_helpers import provider_stream_delivery_suppressed
+        if provider_stream_delivery_suppressed(self):
+            return
         cb = self.tool_gen_callback
         if cb is not None:
             try:
@@ -7612,10 +7627,12 @@ class AIAgent:
                     content[-1]["cache_control"] = {"type": "ephemeral"}
                 break
 
-    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None) -> dict:
+    def _build_api_kwargs(self, api_messages: list, tools_for_api: Optional[list] = None,
+                          extra_body_additions: Optional[dict] = None) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_api_kwargs``."""
         from agent.chat_completion_helpers import build_api_kwargs
-        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api)
+        return build_api_kwargs(self, api_messages, tools_for_api=tools_for_api,
+                                extra_body_additions=extra_body_additions)
 
     def _supports_reasoning_extra_body(self) -> bool:
         """Return True when reasoning extra_body is safe to send for this route/model.
