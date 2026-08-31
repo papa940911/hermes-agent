@@ -118,3 +118,22 @@ def test_dependency_failure_is_explicitly_unavailable(capability_skills):
     dependency = result["required_capability_dependencies"][0]
     assert dependency["status"] == "unavailable"
     assert "Do not substitute model memory" in dependency["synthesis_requirement"]
+
+
+def test_conjunctive_concept_groups_are_request_local(capability_skills):
+    skill_path = capability_skills / "skills" / "pattern-play" / "SKILL.md"
+    text = skill_path.read_text(encoding="utf-8")
+    skill_path.write_text(
+        text.replace(
+            "any_terms: [pattern, length]",
+            "all_any_terms: [[pattern, length], [equipment, ball]]",
+        ),
+        encoding="utf-8",
+    )
+
+    assert "required_capability_dependencies" not in _view(
+        "Interpret this pattern length.", "cap-groups-no-match"
+    )
+    assert _view(
+        "Compare a ball using this pattern length.", "cap-groups-match"
+    )["pre_synthesis_gate"]["status"] == "ready"

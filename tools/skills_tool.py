@@ -1069,6 +1069,54 @@ def _plugin_skill_linked_files(skill_root: Path) -> Dict[str, List[str]] | None:
     return linked or None
 
 
+def _normalized_capability_text(value: Any) -> str:
+    """Normalize punctuation-delimited phrases without adding domain semantics."""
+    return " ".join(re.sub(r"[^\w]+", " ", str(value).casefold()).split())
+
+
+def _capability_condition_matches(
+    condition: Any, normalized_task: str, matched_concepts: set[str] | None = None,
+) -> bool:
+    """Evaluate a declarative request condition without model involvement."""
+    if not isinstance(condition, dict):
+        return False
+    any_terms = condition.get("any_terms", [])
+    all_terms = condition.get("all_terms", [])
+    all_any_terms = condition.get("all_any_terms", [])
+    any_concepts = condition.get("any_concepts", [])
+    all_concepts = condition.get("all_concepts", [])
+    if isinstance(any_terms, str):
+        any_terms = [any_terms]
+    if isinstance(all_terms, str):
+        all_terms = [all_terms]
+    if not isinstance(all_any_terms, list):
+        all_any_terms = []
+    any_terms = [_normalized_capability_text(term) for term in any_terms if str(term).strip()]
+    all_terms = [_normalized_capability_text(term) for term in all_terms if str(term).strip()]
+    groups: List[List[str]] = []
+    for group in all_any_terms:
+        if isinstance(group, str):
+            group = [group]
+        if isinstance(group, list):
+            normalized = [_normalized_capability_text(term) for term in group if str(term).strip()]
+            if normalized:
+                groups.append(normalized)
+    if isinstance(any_concepts, str):
+        any_concepts = [any_concepts]
+    if isinstance(all_concepts, str):
+        all_concepts = [all_concepts]
+    any_concepts = {str(value) for value in any_concepts if str(value).strip()}
+    all_concepts = {str(value) for value in all_concepts if str(value).strip()}
+    concepts = matched_concepts or set()
+    return (
+        (not any_terms or any(term in normalized_task for term in any_terms))
+        and all(term in normalized_task for term in all_terms)
+        and all(any(term in normalized_task for term in group) for group in groups)
+        and (not any_concepts or bool(any_concepts & concepts))
+        and all_concepts <= concepts
+    )
+
+
 def _matching_capability_dependencies(
     frontmatter: Dict[str, Any], user_task: str | None
 ) -> List[Dict[str, Any]]:
@@ -1082,7 +1130,13 @@ def _matching_capability_dependencies(
     declarations = hermes_meta.get("capability_dependencies", [])
     if not isinstance(declarations, list) or not isinstance(user_task, str):
         return []
-    normalized_task = user_task.casefold()
+    normalized_task = _normalized_capability_text(user_task)
+    concept_declarations = hermes_meta.get("request_concepts", {})
+    matched_concepts = {
+        str(name) for name, condition in concept_declarations.items()
+        if isinstance(concept_declarations, dict)
+        and _capability_condition_matches(condition, normalized_task)
+    } if isinstance(concept_declarations, dict) else set()
     matched: List[Dict[str, Any]] = []
     for declaration in declarations:
         if not isinstance(declaration, dict):
@@ -1090,18 +1144,7 @@ def _matching_capability_dependencies(
         when = declaration.get("when", {})
         if not isinstance(when, dict):
             continue
-        any_terms = when.get("any_terms", [])
-        all_terms = when.get("all_terms", [])
-        if isinstance(any_terms, str):
-            any_terms = [any_terms]
-        if isinstance(all_terms, str):
-            all_terms = [all_terms]
-        any_terms = [str(term).casefold() for term in any_terms if str(term).strip()]
-        all_terms = [str(term).casefold() for term in all_terms if str(term).strip()]
-        if (
-            (not any_terms or any(term in normalized_task for term in any_terms))
-            and all(term in normalized_task for term in all_terms)
-        ):
+        if _capability_condition_matches(when, normalized_task, matched_concepts):
             matched.append(declaration)
     return matched
 
@@ -1141,6 +1184,22 @@ def _load_capability_dependencies(
         section_ids = dependency.get("sections", [])
         if isinstance(section_ids, str):
             section_ids = [section_ids]
+        else:
+            section_ids = list(section_ids) if isinstance(section_ids, list) else []
+        conditional_sections = dependency.get("conditional_sections", [])
+        if isinstance(conditional_sections, list):
+            normalized_task = _normalized_capability_text(user_task or "")
+            for conditional in conditional_sections:
+                if not isinstance(conditional, dict) or not _capability_condition_matches(
+                    conditional.get("when", {}), normalized_task
+                ):
+                    continue
+                additions = conditional.get("sections", [])
+                if isinstance(additions, str):
+                    additions = [additions]
+                if isinstance(additions, list):
+                    section_ids.extend(additions)
+        section_ids = list(dict.fromkeys(str(section_id) for section_id in section_ids))
         base = {
             "capability": capability,
             "owning_skill": owner or None,

@@ -243,11 +243,21 @@ def test_real_pattern_play_ready_handoff_with_temporary_hermes_home(tmp_path, mo
     assert set(transitions["properties"]) == {"observation", "action"}
     assert "choice_ref" not in json.dumps(transitions)
     assert schema["properties"]["alternate_ball_choice_refs"]["maxItems"] == 1
+    assert schema["properties"]["starting_ball_reaction_evidence_refs"]["type"] == "array"
+    assert schema["properties"]["alternate_ball_reaction_evidence_refs"]["type"] == "array"
+    start_item = schema["properties"]["starting_ball_reaction_evidence_refs"]["items"]
+    alternate_item = schema["properties"]["alternate_ball_reaction_evidence_refs"]["items"]
+    assert "owned only by starting_ball_choice_ref" in start_item["description"]
+    assert "owned only by the sole alternate_ball_choice_refs choice" in alternate_item["description"]
+    assert "starting_ball_support_refs" not in schema["properties"]
     assert all(key not in json.dumps(schema) for key in ("oneOf", "anyOf"))
     output = handoff["synthesis_contract"]["output"]
     assert "Return exactly one JSON object" in output
     assert "No Markdown. No prose outside JSON." in output
-    assert "Use only supplied num_choice_, eq_choice_, and ball_fact_choice_ refs" in output
+    assert "Use only supplied num_choice_, eq_choice_, and reaction_fact_ refs" in output
+    assert "never author reaction_cmp_ refs" in output.casefold()
+    assert "Do not return ball_fact_choice_ refs" in output
+    assert "never mix start/alternate ownership" in output.casefold()
     # Routing and preparation are entirely local. Before synthesis there is no
     # provider-selected terminal/read/search/manual resolver/arsenal call.
     assert route["preparation_status"] == "READY"

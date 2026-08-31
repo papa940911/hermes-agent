@@ -21,19 +21,25 @@ def _contract_type_schema(description: Any) -> dict[str, Any]:
     if isinstance(description, dict):
         return _contract_object_schema(description)
     text = str(description or "").strip()
-    lower = text.lower()
+    type_text, separator, field_description = text.partition("; description=")
+    lower = type_text.strip().lower()
+    schema: dict[str, Any]
     if "boolean" in lower or lower == "true":
-        return {"type": "boolean"}
-    if lower.startswith("number"):
-        return {"type": ["number", "string"]} if "range" in lower else {"type": "number"}
-    if lower.startswith("array") or " array" in lower:
-        return {"type": "array"}
-    # Pipe-delimited leading tokens in contracts are closed vocabularies.
-    enum_text = text.split(" ", 1)[0]
-    enum_values = enum_text.split("|")
-    if len(enum_values) > 1 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", v) for v in enum_values):
-        return {"type": "string", "enum": enum_values}
-    return {"type": "string"}
+        schema = {"type": "boolean"}
+    elif lower.startswith("number"):
+        schema = {"type": ["number", "string"]} if "range" in lower else {"type": "number"}
+    elif lower.startswith("array") or " array" in lower:
+        schema = {"type": "array"}
+    else:
+        # Pipe-delimited leading tokens in contracts are closed vocabularies.
+        enum_text = type_text.split(" ", 1)[0]
+        enum_values = enum_text.split("|")
+        schema = ({"type": "string", "enum": enum_values}
+                  if len(enum_values) > 1 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", v) for v in enum_values)
+                  else {"type": "string"})
+    if separator and field_description.strip():
+        schema["description"] = field_description.strip()
+    return schema
 
 
 def _contract_object_schema(item: dict[str, Any]) -> dict[str, Any]:
