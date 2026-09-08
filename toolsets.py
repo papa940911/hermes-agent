@@ -311,6 +311,16 @@ TOOLSETS = {
         "includes": []
     },
 
+    "bowling_knowledge": {
+        "description": (
+            "Grounded, cited bowling-technique answers from the curated "
+            "Bowling Knowledge corpus (read-only; always uses the "
+            "known production database, never a caller-supplied path)."
+        ),
+        "tools": ["bowling_knowledge_answer"],
+        "includes": []
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
