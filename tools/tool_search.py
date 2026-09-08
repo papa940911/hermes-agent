@@ -209,11 +209,12 @@ def _core_tool_names() -> frozenset[str]:
 # Narrow native toolsets that must remain directly visible once a session or
 # platform explicitly enables them.  The GUI surfaces stay off
 # ``_HERMES_CORE_TOOLS`` so non-GUI clients never pay their schemas; Bowling
-# Knowledge stays off the global core for the same opt-in reason, but its
-# single grounded-answer schema must be offered directly so the model can
-# select it during an ordinary conversation.
+# Knowledge and BowlingTracker stay off the global core for the same opt-in
+# reason, but their grounded domain schemas must be offered directly so the
+# model can select the correct evidence source during an ordinary conversation.
 _DIRECT_SURFACE_TOOLSETS = frozenset({
     "bowling_knowledge",
+    "bowlingtracker",
     "desktop_ui",
     "project",
 })

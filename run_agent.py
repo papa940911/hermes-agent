@@ -8350,6 +8350,29 @@ class AIAgent:
         if response:
             self._bowling_knowledge_terminal_response = response
 
+    def _apply_bowlingtracker_finalization(
+        self,
+        tool_name: str,
+        function_result: str,
+        messages: list,
+    ) -> None:
+        """Use the native personal-data tool's verified final-form answer."""
+        if getattr(self, "_bowlingtracker_terminal_response", None) is not None:
+            return
+        try:
+            from agent.bowlingtracker_finalization import (
+                bowlingtracker_terminal_response,
+            )
+
+            response = bowlingtracker_terminal_response(
+                tool_name, function_result, messages
+            )
+        except Exception:
+            logger.debug("bowlingtracker finalization check failed", exc_info=True)
+            return
+        if response:
+            self._bowlingtracker_terminal_response = response
+
     def _bowling_knowledge_precall_gate(
         self, function_name: str, function_args: dict,
     ) -> str | None:

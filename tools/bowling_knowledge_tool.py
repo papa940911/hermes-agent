@@ -76,6 +76,9 @@ BOWLING_KNOWLEDGE_ANSWER_SCHEMA = {
         "that expert's answer only, or ask a comparison question "
         "('Compare X and Y on ...') to get each named expert's evidence "
         "kept separate, never blended."
+        " Do not use this tool for the user's sessions, scores, shots, "
+        "patterns bowled, or ball-use history; those are personal records "
+        "served by the bowlingtracker toolset."
     ),
     "parameters": {
         "type": "object",

@@ -7505,6 +7505,24 @@ def run_conversation(
                                 pass
                     break
 
+                if getattr(agent, "_bowlingtracker_terminal_response", None) is not None:
+                    # BowlingTracker's typed read-only tools include a deterministic,
+                    # final-form personal-data answer. End the turn before a model can
+                    # alter sample counts, invent causes, or substitute another source.
+                    final_response = agent._bowlingtracker_terminal_response
+                    agent._bowlingtracker_terminal_response = None
+                    _turn_exit_reason = "bowlingtracker_terminal"
+                    append_message(messages, {"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

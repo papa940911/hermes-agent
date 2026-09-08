@@ -593,6 +593,7 @@ def build_turn_context(
     agent._tool_guardrail_halt_decision = None
     agent._bowling_knowledge_terminal_response = None
     agent._bowling_knowledge_attempted = False
+    agent._bowlingtracker_terminal_response = None
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
     if callable(_reset_consol):
         _reset_consol()

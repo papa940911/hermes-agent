@@ -111,6 +111,7 @@ CONFIGURABLE_TOOLSETS = [
     ("todo",            "📋 Task Planning",             "todo"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
+    ("bowlingtracker",  "🎳 BowlingTracker Personal Data", "read-only sessions, detail, and summaries"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
     ("clarify",         "❓ Clarifying Questions",      "clarify"),
     ("delegation",      "👥 Task Delegation",           "delegate_task"),

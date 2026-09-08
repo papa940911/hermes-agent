@@ -1776,6 +1776,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     _apply_bkf = getattr(agent, "_apply_bowling_knowledge_finalization", None)
                     if callable(_apply_bkf):
                         _apply_bkf(function_name, function_result, messages)
+                _apply_btf = getattr(agent, "_apply_bowlingtracker_finalization", None)
+                if callable(_apply_btf):
+                    _apply_btf(function_name, function_result, messages)
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -2701,6 +2704,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _apply_bkf = getattr(agent, "_apply_bowling_knowledge_finalization", None)
                 if callable(_apply_bkf):
                     _apply_bkf(function_name, function_result, messages)
+            _apply_btf = getattr(agent, "_apply_bowlingtracker_finalization", None)
+            if callable(_apply_btf):
+                _apply_btf(function_name, function_result, messages)
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )

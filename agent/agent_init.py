@@ -866,6 +866,7 @@ def init_agent(
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
     agent._bowling_knowledge_terminal_response: str | None = None
     agent._bowling_knowledge_attempted: bool = False
+    agent._bowlingtracker_terminal_response: str | None = None
 
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False

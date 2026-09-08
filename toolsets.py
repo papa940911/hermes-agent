@@ -321,6 +321,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    "bowlingtracker": {
+        "description": (
+            "Read-only access to the user's personal measured and observed "
+            "BowlingTracker sessions, games, shots, and deterministic summaries."
+        ),
+        "tools": [
+            "bowlingtracker_recent_sessions",
+            "bowlingtracker_session_detail",
+            "bowlingtracker_personal_summary",
+        ],
+        "includes": []
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
