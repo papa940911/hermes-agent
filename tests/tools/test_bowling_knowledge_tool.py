@@ -57,6 +57,19 @@ def test_tool_is_registered():
     assert entry.is_async is False
 
 
+def test_tool_stays_directly_visible_in_model_schema():
+    """Platform opt-in must expose the native tool itself, not defer it
+    behind Tool Search as though it were an MCP/plugin capability."""
+    from model_tools import get_tool_definitions
+
+    definitions = get_tool_definitions(
+        enabled_toolsets=["bowling_knowledge"], quiet_mode=True,
+    )
+    offered_names = [definition["function"]["name"] for definition in definitions]
+
+    assert offered_names == ["bowling_knowledge_answer"]
+
+
 # --- 2: question required -----------------------------------------------------
 
 def test_question_is_required_in_schema():

@@ -206,9 +206,17 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
-# Session-gated GUI toolsets. Off ``_HERMES_CORE_TOOLS`` so non-GUI clients
-# never pay their schema; once a session enables them they stay direct.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+# Narrow native toolsets that must remain directly visible once a session or
+# platform explicitly enables them.  The GUI surfaces stay off
+# ``_HERMES_CORE_TOOLS`` so non-GUI clients never pay their schemas; Bowling
+# Knowledge stays off the global core for the same opt-in reason, but its
+# single grounded-answer schema must be offered directly so the model can
+# select it during an ordinary conversation.
+_DIRECT_SURFACE_TOOLSETS = frozenset({
+    "bowling_knowledge",
+    "desktop_ui",
+    "project",
+})
 
 
 def is_deferrable_tool_name(name: str) -> bool:
@@ -218,7 +226,8 @@ def is_deferrable_tool_name(name: str) -> bool:
     OR it is neither in ``_HERMES_CORE_TOOLS`` nor a session-gated GUI
     surface toolset. Core and direct surface tools are never deferred even
     when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    against accidental shadowing and keeps explicitly enabled native
+    single-purpose tools selectable without a discovery round trip).
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
