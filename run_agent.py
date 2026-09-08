@@ -8320,6 +8320,71 @@ class AIAgent:
             function_result = (function_result or "") + "\n\n" + stall_notice
         return function_result
 
+    def _apply_bowling_knowledge_finalization(
+        self,
+        tool_name: str,
+        function_result: str,
+        messages: list,
+    ) -> None:
+        """Deterministic Bowling Knowledge routing/finalization (Rule 2/3/4).
+
+        First bowling_knowledge_answer result to decide the turn wins, same
+        "first decision sticks" convention as ``_set_tool_guardrail_halt`` --
+        a comparison call issuing multiple tool calls in one turn should not
+        have a later, unrelated call overwrite the outcome.
+        """
+        if getattr(self, "_bowling_knowledge_terminal_response", None) is not None:
+            return
+        try:
+            from agent.bowling_knowledge_finalization import (
+                bowling_knowledge_terminal_response,
+            )
+            response = bowling_knowledge_terminal_response(
+                tool_name, function_result, messages,
+            )
+        except Exception:
+            logger.debug(
+                "bowling knowledge finalization check failed", exc_info=True
+            )
+            return
+        if response:
+            self._bowling_knowledge_terminal_response = response
+
+    def _bowling_knowledge_precall_gate(
+        self, function_name: str, function_args: dict,
+    ) -> str | None:
+        """Rule 1: block web_search/web_extract for a bowling-domain question
+        until bowling_knowledge_answer has been tried this turn.
+
+        Marks bowling_knowledge_answer itself as attempted (never blocks it)
+        and otherwise defers entirely to the pure policy in
+        agent.bowling_knowledge_finalization -- see that module's docstring.
+        """
+        try:
+            from agent.bowling_knowledge_finalization import (
+                BOWLING_KNOWLEDGE_TOOL_NAME,
+                bowling_knowledge_precall_block_reason,
+            )
+        except Exception:
+            logger.debug(
+                "bowling knowledge precall gate import failed", exc_info=True
+            )
+            return None
+        if function_name == BOWLING_KNOWLEDGE_TOOL_NAME:
+            self._bowling_knowledge_attempted = True
+            return None
+        try:
+            messages = getattr(self, "_session_messages", None)
+            return bowling_knowledge_precall_block_reason(
+                function_name, messages,
+                getattr(self, "_bowling_knowledge_attempted", False),
+            )
+        except Exception:
+            logger.debug(
+                "bowling knowledge precall gate check failed", exc_info=True
+            )
+            return None
+
     def _stall_guards_enabled(self) -> bool:
         """Config gate for the runtime anti-stall guards (agent.stall_guards)."""
         return bool(getattr(self, "_stall_guards", True))

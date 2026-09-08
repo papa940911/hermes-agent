@@ -7479,6 +7479,32 @@ def run_conversation(
                     failed = True
                     break
 
+                if getattr(agent, "_bowling_knowledge_terminal_response", None) is not None:
+                    # Bowling Knowledge finalization (Rule 2/3): the tool's own
+                    # result already IS the complete, safe, final-form answer --
+                    # grounded citations for a supported question, or the
+                    # compact insufficient-support message for an unsupported
+                    # one. Deterministically end the turn here instead of
+                    # letting the model decide whether to keep calling tools
+                    # (e.g. web_search) after it, unless the user's own
+                    # message carried explicit current/public-web intent (Rule
+                    # 4) -- in which case
+                    # agent.bowling_knowledge_finalization never sets this in
+                    # the first place and this branch is skipped entirely.
+                    final_response = agent._bowling_knowledge_terminal_response
+                    agent._bowling_knowledge_terminal_response = None
+                    _turn_exit_reason = "bowling_knowledge_terminal"
+                    append_message(messages, {"role": "assistant", "content": final_response})
+                    if final_response:
+                        agent._safe_print(f"\n{final_response}\n")
+                        if agent.stream_delta_callback:
+                            try:
+                                agent.stream_delta_callback(final_response)
+                                agent.stream_delta_callback(None)
+                            except Exception:
+                                pass
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"

@@ -650,21 +650,35 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
-        guardrail_decision = None
+        bowling_gate_message = None
         if block_message is None:
+            _bkf_gate = getattr(agent, "_bowling_knowledge_precall_gate", None)
+            if callable(_bkf_gate):
+                bowling_gate_message = _bkf_gate(function_name, final_args)
+
+        guardrail_decision = None
+        if block_message is None and bowling_gate_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
                 function_name, final_args
             )
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
 
-        if block_message is not None or guardrail_decision is not None:
+        if (
+            block_message is not None
+            or bowling_gate_message is not None
+            or guardrail_decision is not None
+        ):
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
                 result = json.dumps({"error": block_message}, ensure_ascii=False)
                 error_type = block_error_type
                 error_message = block_message
+            elif bowling_gate_message is not None:
+                result = json.dumps({"error": bowling_gate_message}, ensure_ascii=False)
+                error_type = "bowling_knowledge_precall_gate"
+                error_message = bowling_gate_message
             else:
                 result = agent._guardrail_block_result(guardrail_decision)
                 error_type = "guardrail_block"
@@ -1079,6 +1093,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+    # Keep the current turn's transcript reachable from `agent` for hooks
+    # deep in the middleware (e.g. the Bowling Knowledge pre-call routing
+    # gate) that only receive `agent`, not `messages`, as a parameter.
+    agent._session_messages = messages
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -1754,6 +1772,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     failed=is_error,
                     tool_call_id=getattr(tc, "id", "") or "",
                 )
+                if not is_error:
+                    _apply_bkf = getattr(agent, "_apply_bowling_knowledge_finalization", None)
+                    if callable(_apply_bkf):
+                        _apply_bkf(function_name, function_result, messages)
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -1923,6 +1945,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    # See the matching comment in execute_tool_calls_concurrent.
+    agent._session_messages = messages
 
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
@@ -2673,6 +2697,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 failed=_is_error_result,
                 tool_call_id=getattr(tool_call, "id", "") or "",
             )
+            if not _is_error_result:
+                _apply_bkf = getattr(agent, "_apply_bowling_knowledge_finalization", None)
+                if callable(_apply_bkf):
+                    _apply_bkf(function_name, function_result, messages)
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
