@@ -7453,7 +7453,30 @@ def run_conversation(
                 # A UI must never observe an assistant/tool-call row that is
                 # still only an ephemeral in-memory projection. Emit interim
                 # commentary only after the canonical SessionDB append above.
+                #
+                # Bowling Knowledge (Rule 5): a round that calls
+                # bowling_knowledge_answer withholds this message's own
+                # commentary -- any free text riding alongside that tool
+                # call is unreviewed model narration, not the corpus's
+                # answer, and the terminal-response check below only
+                # covers the tool RESULT, not this pre-call text. See
+                # agent/bowling_knowledge_finalization.py.
+                _withhold_for_bkf = False
                 if not duplicate_previous_interim:
+                    try:
+                        from agent.bowling_knowledge_finalization import (
+                            bowling_knowledge_pending_in_tool_calls,
+                        )
+                        _withhold_for_bkf = bowling_knowledge_pending_in_tool_calls(
+                            assistant_message.tool_calls
+                        )
+                    except Exception:
+                        logger.debug(
+                            "bowling knowledge precall commentary check failed",
+                            exc_info=True,
+                        )
+                        _withhold_for_bkf = False
+                if not duplicate_previous_interim and not _withhold_for_bkf:
                     agent._emit_interim_assistant_message(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning

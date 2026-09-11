@@ -92,6 +92,17 @@ _UNSUPPORTED_RESULT = json.dumps({
     "warnings": [],
 })
 
+_WEAK_RESULT = json.dumps({
+    "comparison_mode": False,
+    "answer": "The Bowling Knowledge corpus does not currently contain enough "
+              "relevant sourced evidence to answer that confidently.",
+    "evidence_status": "WEAK",
+    "validation_status": "bypassed",
+    "sources": [],
+    "citations": [],
+    "warnings": ["Only a single incidental search term appears to drive the top match."],
+})
+
 _COMPARISON_RESULT = json.dumps({
     "comparison_mode": True,
     "question": "Compare Mo Pinel and Joe Slowinski on layout.",
@@ -168,6 +179,110 @@ def test_unsupported_answer_terminates_turn_without_web_fallback():
     assert result["turn_exit_reason"] == "bowling_knowledge_terminal"
     assert "does not contain enough sourced evidence" in result["final_response"]
     assert "Sources:" not in result["final_response"]
+
+
+def test_weak_evidence_terminates_turn_without_web_fallback():
+    """Rule 3 also covers WEAK (not just NO_EVIDENCE): a weak-evidence result
+    is terminal, and the outer loop must not supplement it."""
+    agent = _make_agent("bowling_knowledge_answer", "web_search")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="", finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("bowling_knowledge_answer", json.dumps(
+                {"question": "How should I use a balance hole to change my bowling ball reaction?"}
+            ))],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=_WEAK_RESULT),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "How should I use a balance hole to change my bowling ball reaction?"
+        )
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["turn_exit_reason"] == "bowling_knowledge_terminal"
+    assert "does not currently contain enough relevant sourced evidence" in result["final_response"]
+    for leaked in ("mass distribution", "rev rate", "axis tilt"):
+        assert leaked not in result["final_response"].lower()
+
+
+def test_balance_hole_question_never_leaks_precall_model_commentary():
+    """Regression for the exact reported live bug: a model that attaches a
+    free-text preamble to the SAME assistant message as the
+    bowling_knowledge_answer tool call (e.g. "A balance hole works by
+    shifting mass distribution, which changes rev rate and axis tilt...")
+    must not have that preamble surfaced to the user as ordinary mid-turn
+    commentary. That commentary streams BEFORE the tool result -- and
+    before the post-call finalization check -- ever runs, so the terminal-
+    response override alone cannot catch it; Rule 5's precall withholding
+    must (agent.bowling_knowledge_finalization.bowling_knowledge_pending_in_tool_calls)."""
+    agent = _make_agent("bowling_knowledge_answer", "web_search")
+    delivered_interim: list[str] = []
+    agent.interim_assistant_callback = lambda text, already_streamed=False: delivered_interim.append(text)
+
+    hallucinated_preamble = (
+        "A balance hole works by shifting mass distribution in the ball, which "
+        "changes rev rate and axis tilt during the roll."
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content=hallucinated_preamble, finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("bowling_knowledge_answer", json.dumps(
+                {"question": "How should I use a balance hole to change my bowling ball reaction?"}
+            ))],
+        ),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=_WEAK_RESULT),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "How should I use a balance hole to change my bowling ball reaction?"
+        )
+
+    assert delivered_interim == [], (
+        f"Unsupported model preamble leaked to the user before finalization: {delivered_interim}"
+    )
+    assert result["turn_exit_reason"] == "bowling_knowledge_terminal"
+    assert "does not currently contain enough relevant sourced evidence" in result["final_response"]
+    for leaked in ("mass distribution", "rev rate", "axis tilt"):
+        assert leaked not in result["final_response"].lower()
+
+
+def test_non_bowling_precall_commentary_is_never_suppressed():
+    """Rule 5 must only ever key on bowling_knowledge_answer being in the
+    round's tool calls -- an ordinary tool-call preamble for any other tool
+    must keep streaming exactly as before."""
+    agent = _make_agent("web_search")
+    delivered_interim: list[str] = []
+    agent.interim_assistant_callback = lambda text, already_streamed=False: delivered_interim.append(text)
+
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="Let me check the web for that.", finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "weather today"}), "c-w1")],
+        ),
+        _mock_response(content="It's sunny.", finish_reason="stop"),
+    ]
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"results": ["sunny"]})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("What's the weather today?")
+
+    assert delivered_interim == ["Let me check the web for that."]
+    assert result["final_response"] == "It's sunny."
 
 
 def test_comparison_mode_result_terminates_turn_and_keeps_experts_separate():

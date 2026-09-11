@@ -237,6 +237,37 @@ def bowling_knowledge_terminal_response(
     return answer if not citation_block else f"{answer}\n\n{citation_block}"
 
 
+def bowling_knowledge_pending_in_tool_calls(tool_calls: Any) -> bool:
+    """Rule 5: True when this tool round includes a call to
+    ``bowling_knowledge_answer``.
+
+    Rule 2/3 make that call's own result (via
+    :func:`bowling_knowledge_terminal_response`) the sole authoritative,
+    terminal answer for the turn -- but that check only runs AFTER the tool
+    executes. The same assistant message that carries the tool call can
+    also carry free-text ``content`` (a "let me explain how this works
+    while I check..." preamble some providers emit alongside a function
+    call). Left alone, that content is surfaced to the user as ordinary
+    mid-turn commentary before the tool result -- and before the
+    finalization check -- ever runs, which is exactly the "supplement the
+    corpus answer with general bowling knowledge" failure Rule 2/3 closes
+    off, just one step earlier. The caller uses this to withhold that
+    specific message's commentary instead of streaming it unreviewed; the
+    tool call itself, and everything that happens after it runs, is
+    unaffected.
+    """
+    for tool_call in tool_calls or []:
+        function = getattr(tool_call, "function", None)
+        name = getattr(function, "name", None)
+        if name is None and isinstance(tool_call, Mapping):
+            function = tool_call.get("function")
+            if isinstance(function, Mapping):
+                name = function.get("name")
+        if name == BOWLING_KNOWLEDGE_TOOL_NAME:
+            return True
+    return False
+
+
 def bowling_knowledge_precall_block_reason(
     tool_name: str,
     messages: Optional[list],

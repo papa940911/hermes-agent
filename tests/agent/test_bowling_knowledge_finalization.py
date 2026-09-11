@@ -3,15 +3,22 @@
 import inspect
 import json
 
+from types import SimpleNamespace
+
 import agent.bowling_knowledge_finalization as bkf
 from agent.bowling_knowledge_finalization import (
     BOWLING_KNOWLEDGE_TOOL_NAME,
+    bowling_knowledge_pending_in_tool_calls,
     bowling_knowledge_precall_block_reason,
     bowling_knowledge_terminal_response,
     has_explicit_web_intent,
     is_bowling_domain_question,
     latest_user_text,
 )
+
+
+def _tool_call(name, call_id="c1"):
+    return SimpleNamespace(id=call_id, type="function", function=SimpleNamespace(name=name, arguments="{}"))
 
 
 # --- provider/model independence ---------------------------------------------
@@ -244,6 +251,121 @@ def test_empty_answer_string_returns_none():
     assert bowling_knowledge_terminal_response(
         BOWLING_KNOWLEDGE_TOOL_NAME, empty, messages
     ) is None
+
+
+def test_weak_evidence_relayed_as_terminal_bounded_message():
+    """WEAK (like NO_EVIDENCE) must be terminal: the tool's own bounded
+    unsupported message is relayed verbatim, no citations block, no
+    supplementation."""
+    weak = json.dumps({
+        "comparison_mode": False,
+        "answer": "The Bowling Knowledge corpus does not currently contain "
+                  "enough relevant sourced evidence to answer that confidently.",
+        "evidence_status": "WEAK", "validation_status": "bypassed",
+        "sources": [], "citations": [],
+        "warnings": ["Only a single incidental search term appears to drive the top match."],
+    })
+    messages = [{"role": "user", "content": "How should I use a balance hole to change my bowling ball reaction?"}]
+    response = bowling_knowledge_terminal_response(BOWLING_KNOWLEDGE_TOOL_NAME, weak, messages)
+    assert response == (
+        "The Bowling Knowledge corpus does not currently contain enough "
+        "relevant sourced evidence to answer that confidently."
+    )
+    assert "Sources:" not in response
+    # No leaked drilling/mass-distribution/rev-rate/axis-tilt style advice --
+    # the module never invents text beyond the tool's own answer field.
+    for leaked in ("mass distribution", "rev rate", "axis tilt", "balance hole"):
+        assert leaked not in response.lower()
+
+
+def test_ambiguous_evidence_keeps_multiple_angles_explicit():
+    """AMBIGUOUS: the underlying pipeline's multi-angle answer text is relayed
+    as-is -- the finalization layer must not collapse or rewrite it into a
+    single confident claim."""
+    ambiguous = json.dumps({
+        "comparison_mode": False,
+        "answer": (
+            "Evidence spans two distinct angles: some claims describe breakpoint "
+            "shape as driven by layout, others by coverstock chemistry. The "
+            "corpus does not settle which dominates for your setup."
+        ),
+        "evidence_status": "AMBIGUOUS", "validation_status": "ok",
+        "sources": ["Mo Pinel"],
+        "citations": [{
+            "claim_id": "c9", "source_name": "Mo Pinel",
+            "document_title": "Doc", "locator": "p.9", "url": None,
+        }],
+        "warnings": [],
+    })
+    messages = [{"role": "user", "content": "What determines breakpoint shape?"}]
+    response = bowling_knowledge_terminal_response(BOWLING_KNOWLEDGE_TOOL_NAME, ambiguous, messages)
+    assert "two distinct angles" in response
+    assert "layout" in response and "coverstock chemistry" in response
+    assert "does not settle which dominates" in response
+
+
+def test_approve_with_context_mandatory_caveat_survives_relay():
+    """A citation's mandatory_caveat (approve_with_context adjudication) is
+    part of the tool's own evidence-backed answer text; relaying that text
+    verbatim must not strip or alter the caveat substance."""
+    caveat_text = (
+        "Differential ratio can help describe the ball's post-transition shape, "
+        "but it does not independently guarantee a sharper breakpoint because "
+        "coverstock, layout, release, and lane conditions prevent it from being "
+        "deterministic."
+    )
+    usable = json.dumps({
+        "comparison_mode": False,
+        "answer": caveat_text,
+        "evidence_status": "USABLE", "validation_status": "ok",
+        "sources": ["Mo Pinel"],
+        "citations": [{
+            "claim_id": 181, "source_name": "Mo Pinel",
+            "document_title": "The Truth about Drilled Bowling Balls",
+            "locator": "pdf_page P30", "url": None,
+            "adjudication": "approve_with_context",
+            "mandatory_caveat": (
+                "State that cover, layout, release, and lane condition prevent "
+                "differential ratio from being deterministic."
+            ),
+        }],
+        "warnings": [],
+    })
+    messages = [{"role": "user", "content": "Does differential ratio determine breakpoint sharpness?"}]
+    response = bowling_knowledge_terminal_response(BOWLING_KNOWLEDGE_TOOL_NAME, usable, messages)
+    assert caveat_text in response
+    assert "does not independently guarantee" in response
+    assert "Sources:" in response and "Mo Pinel" in response
+
+
+# --- bowling_knowledge_pending_in_tool_calls: Rule 5 -------------------------
+
+def test_pending_true_when_bowling_knowledge_answer_is_among_tool_calls():
+    assert bowling_knowledge_pending_in_tool_calls([_tool_call("bowling_knowledge_answer")])
+
+
+def test_pending_true_in_mixed_batch_with_other_tools():
+    assert bowling_knowledge_pending_in_tool_calls([
+        _tool_call("web_search", "c1"),
+        _tool_call("bowling_knowledge_answer", "c2"),
+    ])
+
+
+def test_pending_false_when_absent():
+    assert not bowling_knowledge_pending_in_tool_calls([_tool_call("web_search")])
+
+
+def test_pending_false_for_empty_or_none():
+    assert not bowling_knowledge_pending_in_tool_calls([])
+    assert not bowling_knowledge_pending_in_tool_calls(None)
+
+
+def test_pending_true_with_dict_shaped_tool_calls():
+    """Some call sites (tests, alternate transports) represent tool calls as
+    plain dicts rather than SDK objects -- the predicate must handle both."""
+    assert bowling_knowledge_pending_in_tool_calls([
+        {"id": "c1", "function": {"name": "bowling_knowledge_answer", "arguments": "{}"}},
+    ])
 
 
 # --- is_bowling_domain_question: Rule 1 / Phase G ----------------------------
