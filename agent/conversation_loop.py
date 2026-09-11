@@ -7520,9 +7520,15 @@ def run_conversation(
                     append_message(messages, {"role": "assistant", "content": final_response})
                     if final_response:
                         agent._safe_print(f"\n{final_response}\n")
+                        # Deliver to BOTH stream consumer slots -- a CLI/TUI-gateway
+                        # session's live UI channel lives on _stream_callback, not
+                        # stream_delta_callback, and never saw this text otherwise.
+                        agent._deliver_deterministic_terminal_text(final_response)
+                        # Only signal the display/gateway callback's end-of-segment
+                        # marker -- _stream_callback (TTS) uses None as an
+                        # end-of-speech sentinel and must NOT receive it here.
                         if agent.stream_delta_callback:
                             try:
-                                agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
@@ -7538,9 +7544,15 @@ def run_conversation(
                     append_message(messages, {"role": "assistant", "content": final_response})
                     if final_response:
                         agent._safe_print(f"\n{final_response}\n")
+                        # Deliver to BOTH stream consumer slots -- a CLI/TUI-gateway
+                        # session's live UI channel lives on _stream_callback, not
+                        # stream_delta_callback, and never saw this text otherwise.
+                        agent._deliver_deterministic_terminal_text(final_response)
+                        # Only signal the display/gateway callback's end-of-segment
+                        # marker -- _stream_callback (TTS) uses None as an
+                        # end-of-speech sentinel and must NOT receive it here.
                         if agent.stream_delta_callback:
                             try:
-                                agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
@@ -7561,9 +7573,15 @@ def run_conversation(
                     # through it so SSE/TUI clients see the explanation.
                     if final_response:
                         agent._safe_print(f"\n{final_response}\n")
+                        # Deliver to BOTH stream consumer slots -- a CLI/TUI-gateway
+                        # session's live UI channel lives on _stream_callback, not
+                        # stream_delta_callback, and never saw this text otherwise.
+                        agent._deliver_deterministic_terminal_text(final_response)
+                        # Only signal the display/gateway callback's end-of-segment
+                        # marker -- _stream_callback (TTS) uses None as an
+                        # end-of-speech sentinel and must NOT receive it here.
                         if agent.stream_delta_callback:
                             try:
-                                agent.stream_delta_callback(final_response)
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass

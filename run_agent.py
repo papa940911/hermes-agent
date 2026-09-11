@@ -7001,6 +7001,33 @@ class AIAgent:
         if delivered:
             self._record_streamed_assistant_text(text)
 
+    def _deliver_deterministic_terminal_text(self, text: str) -> None:
+        """Deliver a deterministic terminal turn's final answer to every stream consumer.
+
+        Bowling Knowledge / BowlingTracker / tool-guardrail terminal turns end the
+        turn immediately after a tool call instead of returning to the model for
+        further streaming, so this text never passes through ``_fire_stream_delta``.
+        It must still reach BOTH consumer slots the same way an ordinary streamed
+        chunk does: ``stream_delta_callback`` (the gateway/SSE/messaging-platform
+        display channel, set once at agent construction) and ``_stream_callback``
+        (the CLI/TUI-gateway per-turn live UI + TTS channel, wired fresh each turn
+        via ``run_conversation(stream_callback=...)`` -- see
+        ``agent/turn_context.py``). A consumer wired only to the slot this text
+        skips never sees the answer, and never sees the turn's completion signal
+        either -- the caller is responsible for the end-of-segment ``None`` on
+        ``stream_delta_callback`` only; ``_stream_callback`` treats ``None`` as an
+        end-of-speech sentinel and must never receive it here.
+        """
+        if not text:
+            return
+        for cb in (self.stream_delta_callback, self._stream_callback):
+            if cb is None:
+                continue
+            try:
+                cb(text)
+            except Exception:
+                pass
+
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
         from agent.chat_completion_helpers import provider_stream_delivery_suppressed
