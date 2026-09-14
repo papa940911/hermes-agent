@@ -77,7 +77,7 @@ def test_activation_uses_skill_view_without_classifier_and_reports_status(monkey
             "preparation": {"status": "LIMITED"},
         })
 
-    monkeypatch.setattr("agent.skill_routing.route_request", lambda request: {
+    monkeypatch.setattr("agent.skill_routing.route_request", lambda request, **kwargs: {
         "route_status": "selected", "route_skill": "trip-planner",
     })
     monkeypatch.setattr(skills_tool, "_skill_view_with_bump", fake_view)
@@ -90,9 +90,62 @@ def test_activation_uses_skill_view_without_classifier_and_reports_status(monkey
     )]
 
 
+def test_activation_forwards_context_only_to_selected_skill_preparation(monkeypatch):
+    calls = []
+
+    def fake_view(args, **kwargs):
+        calls.append((args, kwargs))
+        return json.dumps({
+            "success": True,
+            "name": "trip-planner",
+            "preparation": {"status": "READY"},
+        })
+
+    monkeypatch.setattr("agent.skill_routing.route_request", lambda request, **kwargs: {
+        "route_status": "selected", "route_skill": "trip-planner",
+    })
+    monkeypatch.setattr(skills_tool, "_skill_view_with_bump", fake_view)
+    context = {"schema": "example/v1", "payload": {"id": "selected"}}
+    route, _ = activate_routed_skill(
+        "request one", "task-one", surface_context=context
+    )
+    assert route["preparation_status"] == "READY"
+    assert calls == [(
+        {"name": "trip-planner"},
+        {
+            "task_id": "task-one",
+            "user_task": "request one",
+            "surface_context": context,
+        },
+    )]
+
+
+def test_explicit_context_schema_selects_declared_owner_without_broad_text_match():
+    contextual = {
+        **OWNING,
+        "context_schemas": ["trip_selection/v1"],
+    }
+    result = route_request(
+        "Why did I struggle?",
+        [contextual],
+        surface_context={"schema": "trip_selection/v1", "payload": {"id": "x"}},
+    )
+    assert result == {
+        "route_status": "selected",
+        "route_reason": "unique_strong_owner",
+        "route_skill": "trip-planner",
+        "route_priority": 50,
+        "route_score": 10_000,
+        "matched_groups": ["surface_context_schema"],
+    }
+    assert route_request(
+        "Why did I struggle?", [contextual]
+    )["route_status"] == "no_match"
+
+
 def test_limited_and_failed_do_not_arm_constrained_synthesis(monkeypatch):
     clear_prepared_synthesis()
-    monkeypatch.setattr("agent.skill_routing.route_request", lambda request: {
+    monkeypatch.setattr("agent.skill_routing.route_request", lambda request, **kwargs: {
         "route_status": "selected", "route_skill": "trip-planner",
     })
     for status in ("LIMITED", "FAILED"):

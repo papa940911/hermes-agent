@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 _WORD_RE = re.compile(r"[\w]+", re.UNICODE)
 _CACHE_LOCK = threading.Lock()
 _ROUTING_CACHE: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-_SNAPSHOT_VERSION = 1
+_SNAPSHOT_VERSION = 2
+_STRUCTURED_CONTEXT_ROUTE_SCORE = 10_000
 
 
 def _tokens(value: str) -> tuple[str, ...]:
@@ -64,7 +65,17 @@ def _routing_declaration(frontmatter: dict[str, Any]) -> dict[str, Any] | None:
     priority = routing.get("priority", 0)
     if not isinstance(priority, int) or isinstance(priority, bool):
         return None
-    return {"priority": priority, "groups": normalized_groups}
+    context_schemas = routing.get("context_schemas", [])
+    if not isinstance(context_schemas, list) or any(
+        not isinstance(value, str) or not value.strip()
+        for value in context_schemas
+    ):
+        return None
+    return {
+        "priority": priority,
+        "groups": normalized_groups,
+        "context_schemas": sorted(set(context_schemas)),
+    }
 
 
 def _index_key(files: list[Path], disabled: set[str]) -> tuple[Any, ...]:
@@ -165,13 +176,32 @@ def _phrase_present(request_tokens: tuple[str, ...], phrase: tuple[str, ...]) ->
     return any(request_tokens[index:index + width] == phrase for index in range(len(request_tokens) - width + 1))
 
 
-def route_request(user_request: Any, index: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def route_request(
+    user_request: Any,
+    index: list[dict[str, Any]] | None = None,
+    *,
+    surface_context: Any = None,
+) -> dict[str, Any]:
     """Select one strong owner, or return a deterministic fallback result."""
     if not isinstance(user_request, str) or not user_request.strip():
         return {"route_status": "no_match", "route_reason": "request_not_text"}
     request_tokens = _tokens(user_request)
     matches = []
     for entry in index if index is not None else build_routing_index():
+        context_schema = (
+            surface_context.get("schema")
+            if isinstance(surface_context, dict)
+            and isinstance(surface_context.get("schema"), str)
+            else None
+        )
+        if context_schema in entry.get("context_schemas", []):
+            matches.append({
+                "route_skill": entry["skill"],
+                "route_priority": entry.get("priority", 0),
+                "route_score": _STRUCTURED_CONTEXT_ROUTE_SCORE,
+                "matched_groups": ["surface_context_schema"],
+            })
+            continue
         matched_groups = []
         score = 0
         for group in entry.get("groups", []):
@@ -209,18 +239,25 @@ def route_request(user_request: Any, index: list[dict[str, Any]] | None = None) 
     return {"route_status": "selected", "route_reason": "unique_strong_owner", **winner}
 
 
-def activate_routed_skill(user_request: Any, task_id: str | None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+def activate_routed_skill(
+    user_request: Any,
+    task_id: str | None,
+    *,
+    surface_context: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Route and execute the existing skill_view handler without a model call."""
-    route = route_request(user_request)
+    route = route_request(user_request, surface_context=surface_context)
     if route.get("route_status") != "selected":
         return route, None
     try:
         from tools.skills_tool import _skill_view_with_bump
 
+        view_kwargs = {"task_id": task_id, "user_task": user_request}
+        if surface_context is not None:
+            view_kwargs["surface_context"] = surface_context
         raw = _skill_view_with_bump(
             {"name": route["route_skill"]},
-            task_id=task_id,
-            user_task=user_request,
+            **view_kwargs,
         )
         result = json.loads(raw)
     except Exception as exc:

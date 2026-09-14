@@ -2367,6 +2367,7 @@ def _skill_view_with_bump(args, **kw):
     # cleared on context compression (same hook as read_file's dedup)
     # so a post-compression re-view returns full content again.
     request_context = str(kw.get("user_task") or "")
+    surface_context = kw.get("surface_context")
     stub = _check_skill_view_dedup(
         task_id, name, args.get("file_path"), request_context
     )
@@ -2447,6 +2448,7 @@ def _skill_view_with_bump(args, **kw):
                         capability_dependencies=parsed.get(
                             "required_capability_dependencies", []
                         ),
+                        surface_context=surface_context,
                     )
                     if preparation is not None:
                         # The preparation context becomes the single runtime

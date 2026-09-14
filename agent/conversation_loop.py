@@ -1775,6 +1775,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    surface_context: Any = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1799,11 +1800,18 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
+        surface_context: Optional validated request-scoped object forwarded
+            only to the selected skill's preparation hook.
                 or queuing follow-up prefetch work.
 
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if surface_context is not None:
+        from agent.skill_preparation import detach_surface_context
+
+        surface_context = detach_surface_context(surface_context)
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1879,9 +1887,14 @@ def run_conversation(
     # so preparation, dependencies, and finalization keep their existing owners.
     from agent.skill_routing import activate_routed_skill
 
-    _skill_route, _routed_skill_result = activate_routed_skill(
-        user_message, effective_task_id
-    )
+    if surface_context is None:
+        _skill_route, _routed_skill_result = activate_routed_skill(
+            user_message, effective_task_id
+        )
+    else:
+        _skill_route, _routed_skill_result = activate_routed_skill(
+            user_message, effective_task_id, surface_context=surface_context
+        )
     agent._last_skill_route = _skill_route
 
     # Commentary deduplication spans all provider continuations and tool calls
