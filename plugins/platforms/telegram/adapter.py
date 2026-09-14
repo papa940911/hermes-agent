@@ -326,6 +326,55 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
     ".gif": "image/gif",
 }
 
+_BOWLING_SESSION_COMMAND = "/bowlingsession"
+_MAX_EXPLICIT_SESSION_ID_CHARS = 128
+
+
+def apply_explicit_bowling_session_context(event: MessageEvent) -> bool:
+    """Translate one explicit Telegram command into request-scoped skill context.
+
+    The command is intentionally same-request only::
+
+        /bowlingsession <session-id> <bowling question>
+
+    The session identifier is opaque at this surface.  The owning skill
+    validates the domain contract and the bounded personal-data adapter
+    resolves it downstream.  Returning ``False`` leaves legacy command
+    handling unchanged.
+    """
+
+    text = event.text if isinstance(event.text, str) else ""
+    parts = text.strip().split(None, 2)
+    if not parts or parts[0].casefold().split("@", 1)[0] != _BOWLING_SESSION_COMMAND:
+        return False
+    if len(parts) != 3:
+        return False
+
+    session_id = parts[1].strip()
+    question = parts[2].strip()
+    if (
+        not session_id
+        or len(session_id) > _MAX_EXPLICIT_SESSION_ID_CHARS
+        or not question
+    ):
+        return False
+
+    metadata = dict(event.metadata) if isinstance(event.metadata, dict) else {}
+    if "skill_context" in metadata:
+        return False
+    metadata["skill_context"] = {
+        "schema": "bowling_surface_context/v1",
+        "contextType": "completed_session",
+        "source": "surface_event",
+        "provenance": "explicit_surface_selection",
+        "payload": {"sessionID": session_id},
+    }
+    event.metadata = metadata
+    event.text = question
+    event.message_type = MessageType.TEXT
+    return True
+
+
 def _coerce_duration_seconds(value: Any) -> Optional[int]:
     """Round a raw length to whole positive seconds, or None if unusable."""
     try:
@@ -9616,7 +9665,8 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
-        event.text = self._clean_bot_trigger_text(event.text)
+        if not apply_explicit_bowling_session_context(event):
+            event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         # Telegram clients split messages above 4096 chars into multiple
