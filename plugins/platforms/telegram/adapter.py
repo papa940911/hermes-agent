@@ -327,7 +327,28 @@ _TELEGRAM_IMAGE_EXT_TO_MIME = {
 }
 
 _BOWLING_SESSION_COMMAND = "/bowlingsession"
+_BOWLING_LIVE_COMMAND = "/bowlinglive"
 _MAX_EXPLICIT_SESSION_ID_CHARS = 128
+_MAX_EXPLICIT_LIVE_STATE_ID_CHARS = 200
+
+
+def _telegram_skill_request_id(event: MessageEvent) -> str | None:
+    """Return a stable, non-user Telegram delivery identity."""
+
+    if isinstance(event.platform_update_id, int):
+        return f"telegram-update:{event.platform_update_id}"
+    if isinstance(event.message_id, str) and event.message_id:
+        return f"telegram-message:{event.message_id}"
+    return None
+
+
+def _explicit_bowling_surface_command(event: MessageEvent) -> bool:
+    text = event.text if isinstance(event.text, str) else ""
+    parts = text.strip().split(None, 1)
+    if not parts:
+        return False
+    command = parts[0].casefold().split("@", 1)[0]
+    return command in {_BOWLING_SESSION_COMMAND, _BOWLING_LIVE_COMMAND}
 
 
 def apply_explicit_bowling_session_context(event: MessageEvent) -> bool:
@@ -368,6 +389,67 @@ def apply_explicit_bowling_session_context(event: MessageEvent) -> bool:
         "source": "surface_event",
         "provenance": "explicit_surface_selection",
         "payload": {"sessionID": session_id},
+    }
+    event.metadata = metadata
+    event.text = question
+    event.message_type = MessageType.TEXT
+    return True
+
+
+def apply_explicit_bowling_live_context(event: MessageEvent) -> bool:
+    """Translate one explicit ``/bowlinglive`` request into skill context.
+
+    Use/resume is ``/bowlinglive <live-state-id> <observation>``. Explicit
+    initialization is ``/bowlinglive create <JSON object>``; the outer bowling
+    skill alone validates that domain payload and owns all persistence.
+    """
+
+    text = event.text if isinstance(event.text, str) else ""
+    parts = text.strip().split(None, 2)
+    if not parts or parts[0].casefold().split("@", 1)[0] != _BOWLING_LIVE_COMMAND:
+        return False
+    request_id = _telegram_skill_request_id(event)
+    if request_id is None or len(parts) != 3:
+        return False
+
+    payload: dict[str, Any]
+    question: str
+    if parts[1].casefold() == "create":
+        try:
+            initialization = json.loads(parts[2])
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(initialization, dict):
+            return False
+        payload = {"requestID": request_id, "initialization": initialization}
+        observation_text = initialization.get("observationText")
+        question = (
+            observation_text.strip()
+            if isinstance(observation_text, str) and observation_text.strip()
+            else "Initialize persistent live bowling state."
+        )
+        context_type = "live_state_create"
+    else:
+        live_state_id = parts[1].strip()
+        question = parts[2].strip()
+        if (
+            not live_state_id
+            or len(live_state_id) > _MAX_EXPLICIT_LIVE_STATE_ID_CHARS
+            or not question
+        ):
+            return False
+        payload = {"liveStateID": live_state_id, "requestID": request_id}
+        context_type = "live_state_reference"
+
+    metadata = dict(event.metadata) if isinstance(event.metadata, dict) else {}
+    if "skill_context" in metadata:
+        return False
+    metadata["skill_context"] = {
+        "schema": "bowling_surface_context/v1",
+        "contextType": context_type,
+        "source": "surface_event",
+        "provenance": "explicit_surface_selection",
+        "payload": payload,
     }
     event.metadata = metadata
     event.text = question
@@ -9665,7 +9747,11 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
-        if not apply_explicit_bowling_session_context(event):
+        recognized_bowling_command = _explicit_bowling_surface_command(event)
+        if not (
+            apply_explicit_bowling_session_context(event)
+            or apply_explicit_bowling_live_context(event)
+        ) and not recognized_bowling_command:
             event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -9830,6 +9916,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "[Telegram] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
+            if event.message_type == MessageType.COMMAND:
+                apply_explicit_bowling_session_context(event)
+                apply_explicit_bowling_live_context(event)
             await self.handle_message(event)
             event = None
         except asyncio.CancelledError:
