@@ -7252,6 +7252,11 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Bowling Knowledge review callbacks (bwr:action:token) (Gate 10N) ---
+        if data.startswith("bwr:"):
+            await self._handle_bowling_review_callback(query, data)
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -9718,6 +9723,18 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
+        # --- Bowling Knowledge review UX (Gate 10N) ---------------------
+        # Deterministic, pre-LLM command interception, AFTER the real
+        # authorization check above already passed. Only a message whose
+        # ENTIRE text is a recognized review command (see
+        # telegram_review_router.is_review_command -- exact/word-boundary
+        # match only) is ever intercepted; every other message, including
+        # ordinary conversation, falls through to the normal agent loop
+        # completely unchanged. See plugins/platforms/telegram/
+        # bowling_review_bridge.py for the outer-repo hand-off; this
+        # adapter never contains review-domain logic of its own.
+        if await self._maybe_handle_bowling_review_text(msg):
+            return
         if not self._should_process_message(msg):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.TEXT, update_id=update.update_id)
@@ -9729,6 +9746,143 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
+
+    # --- Bowling Knowledge review UX (Gate 10N) -----------------------------
+    # Thin translation only: build a Gate 10M Inbound, call the outer-repo
+    # ReviewRouter via bowling_review_bridge, map the returned Outbound to a
+    # real Telegram send. No review-domain logic, no SQL, and no promotion
+    # call anywhere in this section -- see bowling_review_bridge.py.
+
+    def _bowling_review_bridge(self):
+        try:
+            from plugins.platforms.telegram import bowling_review_bridge
+        except Exception:
+            logger.warning("[Telegram] Bowling review bridge unavailable", exc_info=True)
+            return None
+        return bowling_review_bridge
+
+    def _build_bowling_review_keyboard(self, keyboard_spec):
+        """Maps Gate 10M's neutral [[{"label","action","token"}, ...], ...]
+        spec to a real InlineKeyboardMarkup. callback_data is always
+        ``bwr:<action>:<token>`` -- a short opaque token, never a raw
+        review_item_id or candidate fingerprint (see
+        telegram_review_session.py for why: those would not fit in
+        Telegram's 64-byte callback_data limit even if this were safe)."""
+        if not keyboard_spec:
+            return None
+        rows = []
+        for row in keyboard_spec:
+            buttons = []
+            for button in row:
+                callback_data = f"bwr:{button['action']}:{button['token']}"
+                buttons.append(InlineKeyboardButton(button["label"], callback_data=callback_data))
+            rows.append(buttons)
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    async def _send_bowling_review_outbound(self, chat_id: str, outbound) -> None:
+        """``outbound`` may be a telegram_review_router.Outbound (has
+        .text/.keyboard) or a plain string -- both are accepted so this
+        method also covers this module's own local fallback error text."""
+        if not self._bot:
+            return
+        text = outbound if isinstance(outbound, str) else outbound.text
+        keyboard = self._build_bowling_review_keyboard(getattr(outbound, "keyboard", None))
+        try:
+            await self._bot.send_message(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                reply_markup=keyboard,
+                **self._link_preview_kwargs(),
+            )
+        except Exception as e:
+            logger.warning(
+                "[Telegram] Bowling review outbound send failed: %s",
+                _redact_telegram_error_text(e),
+            )
+
+    async def _maybe_handle_bowling_review_text(self, msg: Message) -> bool:
+        """Returns True if this message was a recognized review command
+        and has been fully handled (caller must return immediately without
+        any further processing); False means "not a review command, leave
+        this message alone."""
+        text = (msg.text or "").strip()
+        if not text:
+            return False
+        bridge = self._bowling_review_bridge()
+        if bridge is None:
+            return False
+        try:
+            if not bridge.is_review_command(text):
+                return False
+        except Exception:
+            logger.warning("[Telegram] Bowling review command check failed", exc_info=True)
+            return False
+
+        chat_id = getattr(getattr(msg, "chat", None), "id", None)
+        user_id = getattr(getattr(msg, "from_user", None), "id", None)
+        if chat_id is None or user_id is None:
+            return False
+        chat_id, user_id = str(chat_id), str(user_id)
+
+        try:
+            outbound = bridge.handle_text(text, chat_id=chat_id, user_id=user_id)
+        except Exception:
+            logger.warning("[Telegram] Bowling review command handling failed", exc_info=True)
+            await self._send_bowling_review_outbound(
+                chat_id, "Sorry, I couldn't check the review queue right now.",
+            )
+            return True
+
+        await self._send_bowling_review_outbound(chat_id, outbound)
+        return True
+
+    async def _handle_bowling_review_callback(self, query, data: str) -> None:
+        """Handles a ``bwr:<action>:<token>`` inline-button callback --
+        registered from the same _handle_callback_query dispatch table
+        that already routes ``ea:``/``mp:``/``gt:`` etc. callbacks."""
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid data.")
+            return
+        _prefix, action, token = parts
+
+        query_message = getattr(query, "message", None)
+        query_chat_id = getattr(query_message, "chat_id", None)
+        query_chat = getattr(query_message, "chat", None)
+        query_chat_type = getattr(query_chat, "type", None)
+        query_thread_id = getattr(query_message, "message_thread_id", None)
+        query_user_name = getattr(query.from_user, "first_name", None)
+        caller_id = str(getattr(query.from_user, "id", "") or "")
+
+        if not caller_id or not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ Not authorized.")
+            return
+
+        bridge = self._bowling_review_bridge()
+        if bridge is None:
+            await query.answer(text="Sorry, that didn't work.")
+            return
+
+        chat_id = str(query_chat_id) if query_chat_id is not None else None
+        if not chat_id:
+            await query.answer(text="Sorry, that didn't work.")
+            return
+
+        try:
+            outbound = bridge.handle_callback(token, action, chat_id=chat_id, user_id=caller_id)
+        except Exception:
+            logger.warning("[Telegram] Bowling review callback handling failed", exc_info=True)
+            await query.answer(text="Sorry, that didn't work.")
+            return
+
+        await query.answer()
+        await self._send_bowling_review_outbound(chat_id, outbound)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
