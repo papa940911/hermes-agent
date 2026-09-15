@@ -30742,6 +30742,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as exc:
         logger.debug("LLM backend warmup did not start: %s", exc)
 
+    # Gate 10P: best-effort, one-shot priming of the local backend's KV cache
+    # with the REAL static Hermes system-prompt prefix (not the generic Gate
+    # 10O placeholder). Runs on its own background thread after the Gate 10O
+    # warmup; fire-and-forget so it can never delay or fail gateway startup.
+    # See agent/llm_static_prompt_priming.py for the full safety boundary.
+    try:
+        from agent.llm_static_prompt_priming import schedule_startup_priming
+
+        schedule_startup_priming()
+    except Exception as exc:
+        logger.debug("Static-prompt priming did not start: %s", exc)
+
     _ensure_windows_gateway_venv_imports()
 
     # MCP tool discovery — run in an executor so the asyncio event loop
