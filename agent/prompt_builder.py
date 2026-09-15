@@ -4,6 +4,7 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
 assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -1656,6 +1657,24 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
+def skills_manifest_fingerprint(skills_dir: "Path | None" = None) -> str:
+    """A short, deterministic fingerprint of the on-disk skill registry (Gate 10R).
+
+    Wraps the existing ``_build_skills_manifest`` mtime/size map (already the
+    de-facto snapshot-invalidation signal — see ``_load_skills_snapshot``) in
+    a stable, comparable string: unaffected by dict ordering, changes
+    whenever any ``SKILL.md``/``DESCRIPTION.md`` is added, removed, or
+    edited (mtime or size changes), and is otherwise stable — including
+    across process restarts. Intended for cache-priming and observability
+    (e.g. deciding whether a previously-primed skills prefix is still
+    current); it is NOT a security hash and never reads file contents.
+    """
+    resolved = Path(skills_dir) if skills_dir is not None else get_skills_dir()
+    manifest = _build_skills_manifest(resolved)
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+
 def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
@@ -2183,10 +2202,6 @@ def _build_skills_system_prompt_inner(
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
             "\n"
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"

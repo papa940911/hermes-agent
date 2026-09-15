@@ -337,6 +337,51 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def resolve_skills_prompt(agent: Any) -> str:
+    """Build the skills-index block (volatile tier) for *agent*, or ``""``.
+
+    Extracted from :func:`build_system_prompt_parts` (Gate 10R) so the exact
+    same derivation — available tools/toolsets, coding-posture compaction,
+    per-agent skills dir — can also be used by
+    ``agent.static_system_prompt.build_primed_prefix_with_skills`` to prime
+    llama.cpp's KV cache with a byte-identical copy of what a real turn
+    would send. Do not duplicate this logic elsewhere; call this instead.
+    """
+    _r = _ra()
+    has_skills_tools = any(
+        name in agent.valid_tool_names
+        for name in ("skills_list", "skill_view", "skill_manage")
+    )
+    if not has_skills_tools:
+        return ""
+    avail_toolsets = {
+        toolset
+        for toolset in (
+            _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
+        )
+        if toolset
+    }
+    # Focus mode (opt-in) demotes non-coding skill categories to
+    # names-only in the index (never hidden — skill_view/skills_list
+    # reach everything, and every name stays visible for recall). The
+    # default coding posture leaves the index untouched.
+    _compact_cats = frozenset()
+    try:
+        from agent.coding_context import coding_compact_skill_categories
+
+        _compact_cats = coding_compact_skill_categories(
+            platform=agent.platform, cwd=resolve_context_cwd()
+        )
+    except Exception:
+        _compact_cats = frozenset()
+    return _r.build_skills_system_prompt(
+        available_tools=agent.valid_tool_names,
+        available_toolsets=avail_toolsets,
+        compact_categories=_compact_cats or None,
+        skills_dir_override=_agent_skills_dir(agent),
+    )
+
+
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
     """Assemble the system prompt as three ordered cache tiers.
 
@@ -523,36 +568,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if _exec_inject:
             stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
-    has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
-    if has_skills_tools:
-        avail_toolsets = {
-            toolset
-            for toolset in (
-                _r.get_toolset_for_tool(tool_name) for tool_name in agent.valid_tool_names
-            )
-            if toolset
-        }
-        # Focus mode (opt-in) demotes non-coding skill categories to
-        # names-only in the index (never hidden — skill_view/skills_list
-        # reach everything, and every name stays visible for recall). The
-        # default coding posture leaves the index untouched.
-        _compact_cats = frozenset()
-        try:
-            from agent.coding_context import coding_compact_skill_categories
-
-            _compact_cats = coding_compact_skill_categories(
-                platform=agent.platform, cwd=resolve_context_cwd()
-            )
-        except Exception:
-            _compact_cats = frozenset()
-        skills_prompt = _r.build_skills_system_prompt(
-            available_tools=agent.valid_tool_names,
-            available_toolsets=avail_toolsets,
-            compact_categories=_compact_cats or None,
-            skills_dir_override=_agent_skills_dir(agent),
-        )
-    else:
-        skills_prompt = ""
+    skills_prompt = resolve_skills_prompt(agent)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt

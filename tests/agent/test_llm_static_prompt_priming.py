@@ -35,8 +35,11 @@ def _patch_config(monkeypatch, *, base_url, provider="custom", model="test-model
     )
 
 
-def _patch_static_prompt(monkeypatch, text="STATIC-PROMPT-BODY"):
-    monkeypatch.setattr("agent.static_system_prompt.build_static_system_prompt", lambda **_: text)
+def _patch_static_prompt(monkeypatch, text="STATIC-PROMPT-BODY", fingerprint=""):
+    monkeypatch.setattr(
+        "agent.static_system_prompt.build_primed_prefix_with_skills",
+        lambda **_: (text, fingerprint),
+    )
 
 
 # ── Loopback/provider safety gate (delegated to llm_backend_warmup) ────
@@ -45,7 +48,10 @@ def _patch_static_prompt(monkeypatch, text="STATIC-PROMPT-BODY"):
 def test_refuses_remote_provider_before_building_prompt(monkeypatch):
     _patch_config(monkeypatch, base_url="https://api.example.com/v1")
     called = {"n": 0}
-    monkeypatch.setattr("agent.static_system_prompt.build_static_system_prompt", lambda **_: called.__setitem__("n", called["n"] + 1) or "x")
+    monkeypatch.setattr(
+        "agent.static_system_prompt.build_primed_prefix_with_skills",
+        lambda **_: (called.__setitem__("n", called["n"] + 1) or "x", ""),
+    )
     result = priming.prime_static_system_prompt()
     assert result.attempted is False
     assert result.reason == "no_local_backend_configured"
@@ -324,7 +330,7 @@ def test_priming_handles_prompt_build_failure_harmlessly(monkeypatch, fake_llama
     base_url, state = fake_llama_server
     _patch_config(monkeypatch, base_url=base_url)
     monkeypatch.setattr(
-        "agent.static_system_prompt.build_static_system_prompt",
+        "agent.static_system_prompt.build_primed_prefix_with_skills",
         lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     result = priming.prime_static_system_prompt(health_timeout_seconds=5, request_timeout_seconds=5)

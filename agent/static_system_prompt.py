@@ -1,4 +1,4 @@
-"""Side-effect-free construction of Hermes's real static system-prompt prefix (Gate 10P).
+"""Side-effect-free construction of Hermes's real static system-prompt prefix (Gate 10P, extended Gate 10R).
 
 ``agent.system_prompt.build_system_prompt_parts(agent)`` already splits Hermes's
 system prompt into three cache tiers (see that module's docstring): ``stable``
@@ -40,7 +40,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["build_static_system_prompt", "resolve_static_prompt_tool_names"]
+__all__ = [
+    "build_static_system_prompt",
+    "build_primed_prefix_with_skills",
+    "resolve_static_prompt_tool_names",
+]
 
 
 def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) -> frozenset:
@@ -188,3 +192,101 @@ def build_static_system_prompt(
 
     parts = build_system_prompt_parts(view)
     return parts["stable"]
+
+
+def build_primed_prefix_with_skills(
+    *,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    platform: str = "telegram",
+    context_length: Optional[int] = None,
+) -> "tuple[str, str]":
+    """Gate 10R: the stable tier PLUS the skills index, for KV-cache priming.
+
+    Gate 10P (:func:`build_static_system_prompt`) primes only the ``stable``
+    tier, by design — the skills index is registry-mutable and therefore
+    correctly lives in the ``volatile`` tier of a real turn's prompt (see
+    ``agent.system_prompt.build_system_prompt_parts``'s docstring and
+    ``tests/agent/test_static_system_prompt.py::test_skills_index_excluded_from_static_tier``,
+    which this function must NOT violate — it does not change what "stable"
+    means, it builds an ADDITIONAL, separate priming prefix).
+
+    On the common real deployment (Telegram, no cwd context files — the
+    ``context`` tier is empty), ``stable + "\\n\\n" + skills_index`` is a
+    fully deterministic byte-for-byte prefix of what a real first turn
+    sends, right up to where genuinely per-session content (memory,
+    timestamp, session id) begins. Priming the backend's single KV-cache
+    slot (``--parallel 1``) with this longer prefix — instead of just
+    ``stable`` — lets a real first message reuse cache through the skills
+    index too, instead of paying its full prefill cost from scratch.
+
+    Uses the SAME :func:`agent.system_prompt.resolve_skills_prompt` helper
+    that a real turn calls (no re-derivation, so this can never drift out
+    of byte-parity with production) and the SAME duck-typed, side-effect-free
+    view as :func:`build_static_system_prompt` (no AIAgent, no session, no
+    memory content, no tool call, no network I/O other than the caller's
+    own priming POST).
+
+    Returns ``(prefix, skills_fingerprint)`` — the fingerprint
+    (:func:`agent.prompt_builder.skills_manifest_fingerprint`) is a cheap,
+    deterministic signal callers can use to detect that the on-disk skill
+    registry changed since this prefix was primed (add/remove/edit a
+    ``SKILL.md``) and decide whether to re-prime. An empty ``skills_index``
+    (no skills installed, or none visible for *platform*) returns the plain
+    stable prefix and an empty fingerprint is still returned for the
+    (skill-less) registry state.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    cfg = load_config_readonly() or {}
+    model_cfg = cfg.get("model") or {}
+    resolved_model = model if model is not None else str(model_cfg.get("default") or "")
+    resolved_provider = provider if provider is not None else str(model_cfg.get("provider") or "")
+    resolved_context_length = (
+        context_length if context_length is not None else model_cfg.get("context_length")
+    )
+    if not isinstance(resolved_context_length, int) or resolved_context_length <= 0:
+        resolved_context_length = None
+
+    mem_cfg = cfg.get("memory") or {}
+    memory_enabled = bool(mem_cfg.get("memory_enabled", True))
+    user_profile_enabled = bool(mem_cfg.get("user_profile_enabled", True))
+
+    agent_cfg = cfg.get("agent") or {}
+    platform_hint_overrides = agent_cfg.get("platform_hints")
+    if not isinstance(platform_hint_overrides, dict):
+        platform_hint_overrides = None
+
+    valid_tool_names = resolve_static_prompt_tool_names(platform=platform)
+
+    view = _static_prompt_agent_view(
+        model=resolved_model,
+        provider=resolved_provider,
+        platform=platform,
+        context_length=resolved_context_length,
+        memory_enabled=memory_enabled,
+        user_profile_enabled=user_profile_enabled,
+        platform_hint_overrides=platform_hint_overrides,
+        valid_tool_names=valid_tool_names,
+    )
+
+    from agent.system_prompt import build_system_prompt_parts, resolve_skills_prompt
+    from agent.prompt_builder import skills_manifest_fingerprint
+
+    parts = build_system_prompt_parts(view)
+    try:
+        skills_index = resolve_skills_prompt(view)
+    except Exception:
+        logger.debug("primed-prefix-with-skills: skills resolution failed", exc_info=True)
+        skills_index = ""
+
+    try:
+        fingerprint = skills_manifest_fingerprint() if skills_index else ""
+    except Exception:
+        logger.debug("primed-prefix-with-skills: fingerprint failed", exc_info=True)
+        fingerprint = ""
+
+    prefix = "\n\n".join(
+        p.strip() for p in (parts["stable"], parts["context"], skills_index) if p and p.strip()
+    )
+    return prefix, fingerprint

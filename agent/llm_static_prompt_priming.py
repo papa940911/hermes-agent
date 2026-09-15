@@ -1,5 +1,6 @@
 """One-shot, best-effort local-backend KV-cache priming with the real Hermes
-static system-prompt prefix (Gate 10P).
+static system-prompt prefix (Gate 10P; extended to include the skills index
+in Gate 10R — see ``agent.static_system_prompt.build_primed_prefix_with_skills``).
 
 Gate 10O (``agent/llm_backend_warmup.py``) established that this deployment's
 dominant first-response latency source is llama.cpp prompt prefill after a
@@ -20,9 +21,10 @@ Safety boundary (mirrors ``llm_backend_warmup.py``; see tests in
   - Exactly one priming attempt per process lifetime (module-level guard).
   - Waits for ``/health`` with a bounded retry budget before priming; never
     polls unboundedly.
-  - Builds the prompt via ``agent.static_system_prompt.build_static_system_prompt``
-    — pure config/file reads only: no AIAgent, no conversation, no session
-    row, no memory write, no tool call, no Telegram/Discord/etc. send.
+  - Builds the prompt via ``agent.static_system_prompt.build_primed_prefix_with_skills``
+    (Gate 10P's stable tier plus the Gate 10R skills index) — pure config/file
+    reads only: no AIAgent, no conversation, no session row, no memory write,
+    no tool call, no Telegram/Discord/etc. send.
   - The completion output is discarded; only token counts and timings are
     logged (content-free) via the existing ``agent.latency_diagnostics``-style
     debug/info channel — never the prompt text, never an API key.
@@ -81,6 +83,12 @@ class PrimingResult:
     prompt_tokens: Optional[int]
     cached_tokens: Optional[int]
     reason: str
+    # Gate 10R: fingerprint of the on-disk skill registry at priming time
+    # ("" when no skills are visible for the primed platform). Lets a
+    # caller detect that skills changed since the prefix was primed and
+    # decide whether a re-prime is worthwhile — never used to invalidate
+    # anything automatically here.
+    skills_fingerprint: str = ""
 
 
 def reset_priming_state_for_tests() -> None:
@@ -190,9 +198,9 @@ def prime_static_system_prompt(
         )
 
     try:
-        from agent.static_system_prompt import build_static_system_prompt
+        from agent.static_system_prompt import build_primed_prefix_with_skills
 
-        static_prompt = build_static_system_prompt(
+        static_prompt, skills_fingerprint = build_primed_prefix_with_skills(
             model=backend["model"] or None, platform=platform,
         )
     except Exception:
@@ -234,14 +242,16 @@ def prime_static_system_prompt(
                     cached_tokens = details.get("cached_tokens")
             logger.info(
                 "static-prompt priming succeeded: attempt=%d elapsed_ms=%d "
-                "prompt_chars=%d prompt_tokens=%s cached_tokens=%s endpoint_host=%s",
+                "prompt_chars=%d prompt_tokens=%s cached_tokens=%s skills_fingerprint=%s endpoint_host=%s",
                 attempt, elapsed_ms, len(static_prompt), prompt_tokens, cached_tokens,
+                skills_fingerprint or "-",
                 urlparse(backend["base_url"]).hostname,
             )
             return PrimingResult(
                 attempted=True, succeeded=True, attempts=attempt, elapsed_ms=elapsed_ms,
                 prompt_chars=len(static_prompt), prompt_tokens=prompt_tokens,
                 cached_tokens=cached_tokens, reason="ok",
+                skills_fingerprint=skills_fingerprint,
             )
         except Exception as exc:  # noqa: BLE001 - priming must never propagate
             last_error = type(exc).__name__
@@ -257,7 +267,7 @@ def prime_static_system_prompt(
     return PrimingResult(
         attempted=True, succeeded=False, attempts=max_attempts, elapsed_ms=elapsed_ms,
         prompt_chars=len(static_prompt), prompt_tokens=None, cached_tokens=None,
-        reason=last_error,
+        reason=last_error, skills_fingerprint=skills_fingerprint,
     )
 
 
