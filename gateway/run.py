@@ -18802,6 +18802,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
+        # Gate 10O: opt-in latency phase recorder. A no-op unless
+        # HERMES_LATENCY_DIAG is set; see agent/latency_diagnostics.py.
+        try:
+            from agent.latency_diagnostics import start_recording
+
+            start_recording(
+                session_id=source.chat_id or source.user_id,
+                platform=_platform_name,
+            )
+        except Exception:
+            pass
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
@@ -20162,6 +20173,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            try:
+                from agent.latency_diagnostics import mark_phase
+
+                mark_phase("agent_ready")
+            except Exception:
+                pass
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -20255,6 +20272,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _platform_name, source.chat_id or "unknown",
                 _response_time, _api_calls, _resp_len,
             )
+            # Gate 10O: finalize + emit the opt-in latency phase record for
+            # this turn (no-op unless HERMES_LATENCY_DIAG is set). Never
+            # logs response/prompt content — timings and counts only.
+            try:
+                from agent.latency_diagnostics import finish_and_emit
+
+                finish_and_emit(
+                    prompt_tokens=agent_result.get("last_prompt_tokens") or None,
+                )
+            except Exception:
+                pass
 
             # NOTE: the cross-process cache-coherence re-baseline
             # (_refresh_agent_cache_message_count) is intentionally deferred
@@ -30702,6 +30730,17 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         start_nous_auth_keepalive()
     except Exception as exc:
         logger.debug("Nous auth keepalive did not start: %s", exc)
+
+    # Gate 10O: best-effort, one-shot local LLM backend warmup. Fire-and-
+    # forget (never awaited) so a slow/unreachable backend cannot delay or
+    # fail gateway startup. No-op for any non-loopback/non-local provider.
+    # See agent/llm_backend_warmup.py for the full safety boundary.
+    try:
+        from agent.llm_backend_warmup import schedule_startup_warmup
+
+        schedule_startup_warmup()
+    except Exception as exc:
+        logger.debug("LLM backend warmup did not start: %s", exc)
 
     _ensure_windows_gateway_venv_imports()
 

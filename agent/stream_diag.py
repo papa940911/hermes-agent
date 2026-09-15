@@ -45,6 +45,12 @@ def stream_diag_init() -> Dict[str, Any]:
     block when a stream dies.  Lives on ``request_client_holder`` so it
     survives across the closure boundary.
     """
+    try:
+        from agent.latency_diagnostics import mark_phase
+
+        mark_phase("llm_start")
+    except Exception:
+        pass
     return {
         "started_at": time.time(),
         "first_chunk_at": None,
