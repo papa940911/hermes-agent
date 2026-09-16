@@ -38,10 +38,30 @@ Priming improves the common case (nothing else fires in that narrow window)
 but does not guarantee the first real request is a cache hit — see the
 Gate 10P report for measured eviction risk and the recommended follow-up
 (a separate, measured evaluation of ``--parallel 2`` / two KV slots).
+
+Gate 10S: ``gateway.run.start_gateway`` used to ALSO schedule Gate 10O's
+generic backend warmup (``agent.llm_backend_warmup.schedule_startup_
+warmup``) immediately before this module's own ``schedule_startup_
+priming``, as two independent daemon threads. Both hit the same single KV
+slot with their own unrelated bounded health-wait/retry loops and no
+ordering between them, so whichever POST actually landed last on the
+backend nondeterministically decided what ended up cached — sometimes the
+useless generic placeholder, sometimes this module's real prefix. Gate 10S
+removed the generic warmup from the startup path entirely (its useful
+behavior — reachability check, chat-template exercise, first-call kernel
+ramp-up — is a strict subset of what THIS module's own real inference call
+already does), so this priming call is now the ONLY startup action that can
+touch the model, making its outcome deterministic by construction rather
+than by scheduling order. See ``wait_for_priming_ready`` for an opt-in,
+bounded way for a caller to avoid racing the remaining, much narrower
+window (a genuine user message arriving before this one priming call
+finishes) — not wired in automatically, since a missed prime only costs
+one turn its cache speedup, never correctness.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import threading
@@ -60,6 +80,8 @@ __all__ = [
     "prime_static_system_prompt",
     "schedule_startup_priming",
     "reset_priming_state_for_tests",
+    "wait_for_priming_ready",
+    "get_last_priming_result",
 ]
 
 _PRIMING_USER_MESSAGE = "Reply with only the word READY."
@@ -71,6 +93,18 @@ _DEFAULT_HEALTH_POLL_INTERVAL_SECONDS = 0.5
 
 # Process-lifetime guard: priming must fire at most once per gateway run.
 _priming_already_scheduled = False
+
+# Gate 10S: set (unconditionally, in a ``finally``) once the ONE scheduled
+# background priming attempt concludes — success, failure, exception, or a
+# same-process no-op (non-local backend). Never set on a fresh process/after
+# ``reset_priming_state_for_tests()``, so a bounded wait on it can never
+# return a stale "ready" from a previous, unrelated process lifetime.
+_priming_done_event = threading.Event()
+
+# Observability only (Gate 10S): the most recent background priming
+# outcome, for a status endpoint or diagnostic to read without re-running
+# anything. Content-free (see PrimingResult — no prompt text, no user data).
+_last_priming_result: Optional["PrimingResult"] = None
 
 
 @dataclass(frozen=True)
@@ -89,12 +123,53 @@ class PrimingResult:
     # decide whether a re-prime is worthwhile — never used to invalidate
     # anything automatically here.
     skills_fingerprint: str = ""
+    # Gate 10S: wall-clock (time.time()) bounds of the background priming
+    # attempt, for observability only — never used for cache logic. None
+    # when the result was constructed directly (e.g. by a caller of
+    # ``prime_static_system_prompt`` outside the scheduled background path).
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
 
 
 def reset_priming_state_for_tests() -> None:
     """Test-only: clear the process-lifetime guard between test cases."""
-    global _priming_already_scheduled
+    global _priming_already_scheduled, _last_priming_result
     _priming_already_scheduled = False
+    _priming_done_event.clear()
+    _last_priming_result = None
+
+
+def wait_for_priming_ready(timeout: float = 5.0) -> bool:
+    """Bounded, opt-in wait for the ONE scheduled background prime to finish.
+
+    Returns True once priming has concluded (whatever the outcome — success
+    or failure), False if *timeout* elapses first. Never raises, never
+    blocks longer than *timeout*, and never blocks at all if priming was
+    never scheduled in this process (the wait simply times out and the
+    caller proceeds — see module docstring: "no user request may hang
+    indefinitely").
+
+    Nothing in this module calls this automatically today — it exists so a
+    caller that wants to avoid racing the startup prime (e.g. the very
+    first inbound message right after a gateway restart) CAN opt in with a
+    short, bounded wait, without this module reaching into the request path
+    itself. See the Gate 10S report for why the live gateway does not wire
+    this in by default (the proven race — two independent warmup actors —
+    is eliminated by removing the redundant one, not by blocking traffic;
+    a missed prime just costs one turn its cache speedup, not correctness).
+    """
+    try:
+        return _priming_done_event.wait(max(0.0, timeout))
+    except Exception:
+        return False
+
+
+def get_last_priming_result() -> Optional["PrimingResult"]:
+    """The most recent background priming outcome, or None if never run.
+
+    Read-only observability accessor — never triggers a (re-)prime.
+    """
+    return _last_priming_result
 
 
 def _health_url(base_url: str) -> str:
@@ -272,10 +347,32 @@ def prime_static_system_prompt(
 
 
 def _run_priming_in_background() -> None:
+    """Gate 10S: the ONE background action that may touch the model at
+    startup. Always records a result and always signals
+    ``_priming_done_event`` in a ``finally`` — regardless of outcome — so
+    :func:`wait_for_priming_ready` and :func:`get_last_priming_result` are
+    reliable for every code path (success, failure, exception, or a
+    same-process no-op for a non-local backend)."""
+    global _last_priming_result
+    started_at = time.time()
     try:
-        prime_static_system_prompt()
+        result = prime_static_system_prompt()
     except Exception:
         logger.debug("static-prompt priming: background task failed", exc_info=True)
+        result = PrimingResult(
+            attempted=True, succeeded=False, attempts=0, elapsed_ms=None,
+            prompt_chars=None, prompt_tokens=None, cached_tokens=None,
+            reason="unexpected_exception",
+        )
+    finally:
+        completed_at = time.time()
+        try:
+            _last_priming_result = dataclasses.replace(
+                result, started_at=started_at, completed_at=completed_at,
+            )
+        except Exception:
+            _last_priming_result = result
+        _priming_done_event.set()
 
 
 def schedule_startup_priming() -> bool:

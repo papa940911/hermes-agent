@@ -30731,22 +30731,28 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as exc:
         logger.debug("Nous auth keepalive did not start: %s", exc)
 
-    # Gate 10O: best-effort, one-shot local LLM backend warmup. Fire-and-
-    # forget (never awaited) so a slow/unreachable backend cannot delay or
-    # fail gateway startup. No-op for any non-loopback/non-local provider.
-    # See agent/llm_backend_warmup.py for the full safety boundary.
-    try:
-        from agent.llm_backend_warmup import schedule_startup_warmup
-
-        schedule_startup_warmup()
-    except Exception as exc:
-        logger.debug("LLM backend warmup did not start: %s", exc)
-
-    # Gate 10P: best-effort, one-shot priming of the local backend's KV cache
-    # with the REAL static Hermes system-prompt prefix (not the generic Gate
-    # 10O placeholder). Runs on its own background thread after the Gate 10O
-    # warmup; fire-and-forget so it can never delay or fail gateway startup.
-    # See agent/llm_static_prompt_priming.py for the full safety boundary.
+    # Gate 10O originally scheduled a generic backend warmup here (a bare
+    # "Reply with only the word READY." request, no system prompt) on its
+    # own daemon thread, immediately followed by Gate 10P/10R's real
+    # stable+skills priming on a SECOND, independent daemon thread. Gate 10S
+    # found and fixed a real race: both threads ran their own bounded
+    # health-wait/retry loops against the SAME single-slot (--parallel 1)
+    # llama.cpp backend with no ordering between them, so whichever POST
+    # happened to land last "won" the KV cache — sometimes the generic
+    # placeholder, sometimes the real prefix, nondeterministically. Direct
+    # measurement (Gate 10S report) confirmed the real prime is a strict
+    # superset of what the generic warmup provided (backend reachability,
+    # chat-template exercise, and kernel/first-call ramp-up are all paid by
+    # the real prime's own inference call too), so the generic warmup is no
+    # longer scheduled here — the real prime is now the ONLY startup action
+    # that touches the model, which makes its outcome deterministic by
+    # construction (nothing else can race it). ``agent.llm_backend_warmup``
+    # itself is untouched and still fully importable/callable (tests,
+    # diagnostics, or a future manual `hermes` subcommand) — it is simply no
+    # longer wired into normal gateway startup. See
+    # agent/llm_static_prompt_priming.py for the full safety boundary and
+    # ``agent.llm_static_prompt_priming.wait_for_priming_ready`` for a
+    # bounded, opt-in readiness check any caller may use.
     try:
         from agent.llm_static_prompt_priming import schedule_startup_priming
 

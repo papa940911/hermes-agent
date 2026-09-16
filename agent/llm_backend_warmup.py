@@ -20,6 +20,20 @@ conversation merely to warm Hermes unless unavoidable"). The dominant,
 prompt-size-scaled portion of cold-start latency is a separate, larger
 follow-up (see the report's recommended next step).
 
+Gate 10S: this module is no longer scheduled automatically by
+``gateway.run.start_gateway`` — measurement showed its generic warmup
+request and Gate 10P/10R's real stable+skills priming (``agent.
+llm_static_prompt_priming``) were two independent, unordered background
+threads racing the SAME single llama.cpp KV slot (``--parallel 1``), and
+that the real prime's own inference call already pays down everything this
+generic warmup provides (backend reachability, chat-template exercise,
+first-call kernel ramp-up) for a backend that stays resident across gateway
+restarts. Removing the redundant actor made startup priming deterministic
+by construction rather than by ordering. This module, its tests, and
+``warm_local_llamacpp_backend``/``schedule_startup_warmup`` are otherwise
+completely unchanged and remain available for manual/diagnostic use or a
+future opt-in call site — see the Gate 10S report for the full comparison.
+
 Safety boundary (all enforced below, see tests in
 ``tests/agent/test_llm_backend_warmup.py``):
   - Only ever targets a loopback base_url (127.0.0.1 / localhost / ::1).

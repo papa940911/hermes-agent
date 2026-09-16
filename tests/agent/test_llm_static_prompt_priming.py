@@ -502,15 +502,15 @@ def test_priming_result_is_a_plain_dataclass_with_expected_fields():
 # ── Gateway wiring ───────────────────────────────────────────────────
 
 
-def test_gateway_run_schedules_priming_after_gate10o_warmup():
+def test_gateway_run_schedules_only_the_real_prime_gate10s():
+    """Gate 10S: the generic Gate 10O warmup is no longer scheduled at
+    startup at all — schedule_startup_priming() is the ONLY startup action
+    that can touch the model, so there is no second actor left to race."""
     import gateway.run as gw_run
 
     source = inspect.getsource(gw_run.start_gateway)
-    warmup_pos = source.find("schedule_startup_warmup()")
-    priming_pos = source.find("schedule_startup_priming()")
-    assert warmup_pos != -1
-    assert priming_pos != -1
-    assert priming_pos > warmup_pos  # priming fires after the Gate 10O warmup
+    assert "schedule_startup_warmup()" not in source
+    assert source.count("schedule_startup_priming()") == 1
 
 
 def test_gateway_wiring_never_awaits_priming():
