@@ -106,7 +106,15 @@ __all__ = [
 _PRIMING_USER_MESSAGE = "Reply with only the word READY."
 _DEFAULT_MAX_ATTEMPTS = 3
 _DEFAULT_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
-_DEFAULT_REQUEST_TIMEOUT_SECONDS = 180.0
+# Cache-eviction diagnostic (/tmp/hermes-cache-eviction-diagnostic.txt):
+# a true-cold prime of the real ~15k-token Hermes prefix measured
+# 225-290s+ on this hardware — the previous 180s default guaranteed the
+# first attempt would time out client-side on every true-cold prime
+# (llama.cpp kept processing regardless, so the retry usually "succeeded"
+# fast off the now-warm cache, but only after wasting ~180s first). 360s
+# gives ~25% margin above the highest measured value without masking a
+# genuinely hung backend for an unreasonable time.
+_DEFAULT_REQUEST_TIMEOUT_SECONDS = 360.0
 _DEFAULT_HEALTH_TIMEOUT_SECONDS = 30.0
 _DEFAULT_HEALTH_POLL_INTERVAL_SECONDS = 0.5
 
