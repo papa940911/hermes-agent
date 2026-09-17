@@ -42,6 +42,13 @@ def _patch_static_prompt(monkeypatch, text="STATIC-PROMPT-BODY", fingerprint="")
     )
 
 
+def _patch_tools(monkeypatch, tools=None):
+    monkeypatch.setattr(
+        "agent.static_system_prompt.resolve_static_prompt_tools",
+        lambda **_: tools if tools is not None else [],
+    )
+
+
 # ── Loopback/provider safety gate (delegated to llm_backend_warmup) ────
 
 
@@ -66,6 +73,7 @@ class _FakeServerState:
     health_behavior = "ok"
     request_log: list = []
     seen_system_prompts: list = []
+    seen_tools: list = []
     _attempts = 0
 
 
@@ -106,6 +114,7 @@ class _FakeLlamaHandler(http.server.BaseHTTPRequestHandler):
             assert payload["stream"] is False
             system_msg = next((m["content"] for m in payload["messages"] if m["role"] == "system"), None)
             self.state.seen_system_prompts.append(system_msg)
+            self.state.seen_tools.append(payload.get("tools"))
             resp = json.dumps({
                 "choices": [{"message": {"role": "assistant", "content": "READY"}}],
                 "usage": {"prompt_tokens": 42, "prompt_tokens_details": {"cached_tokens": 7}},
@@ -152,6 +161,7 @@ class _FakeLlamaHandler(http.server.BaseHTTPRequestHandler):
 def fake_llama_server():
     _FakeServerState.request_log = []
     _FakeServerState.seen_system_prompts = []
+    _FakeServerState.seen_tools = []
     _FakeServerState.behavior = "ok"
     _FakeServerState.health_behavior = "ok"
     _FakeServerState._attempts = 0
@@ -204,6 +214,72 @@ def test_priming_uses_same_model_field_as_configured(monkeypatch, fake_llama_ser
     _patch_static_prompt(monkeypatch)
     result = priming.prime_static_system_prompt(health_timeout_seconds=5, request_timeout_seconds=5)
     assert result.succeeded is True
+
+
+# ── Gate CS9: priming must send the same ``tools`` a real turn sends ─────
+#
+# Root cause (see /tmp/hermes-cold-start-root-cause-report.txt): a real turn
+# always sends ``tools=agent.tools or None`` alongside the system prompt.
+# llama.cpp's Qwen chat template renders an entire extra "# Tools" system
+# block AHEAD of the caller-supplied system message whenever ``tools`` is
+# non-empty, so a priming POST that omits ``tools`` primes a KV-cache prefix
+# that no real tool-using turn can ever reuse -- live-measured at ~290s of
+# unnecessary full-prompt prefill on the first real turn. These tests pin
+# the fix: priming now resolves and sends the real tool schema list.
+
+
+def test_priming_includes_resolved_tools_in_request(monkeypatch, fake_llama_server):
+    base_url, state = fake_llama_server
+    _patch_config(monkeypatch, base_url=base_url)
+    _patch_static_prompt(monkeypatch)
+    fake_tools = [{"type": "function", "function": {"name": "bowling_knowledge_answer", "parameters": {}}}]
+    _patch_tools(monkeypatch, tools=fake_tools)
+    priming.prime_static_system_prompt(health_timeout_seconds=5, request_timeout_seconds=5)
+    assert state.seen_tools == [fake_tools]
+
+
+def test_priming_omits_tools_key_when_none_resolved(monkeypatch, fake_llama_server):
+    """Matches the real request convention (``tools=agent.tools or None``):
+    an empty resolution must not send a spurious empty ``tools: []``, which
+    some chat templates treat differently from an absent/null field."""
+    base_url, state = fake_llama_server
+    _patch_config(monkeypatch, base_url=base_url)
+    _patch_static_prompt(monkeypatch)
+    _patch_tools(monkeypatch, tools=[])
+    priming.prime_static_system_prompt(health_timeout_seconds=5, request_timeout_seconds=5)
+    assert state.seen_tools == [None]
+
+
+def test_priming_tool_resolution_failure_does_not_block_priming(monkeypatch, fake_llama_server):
+    """A tool-resolution failure must degrade to no-tools priming, never
+    abort the whole (still-useful) system-prompt prime."""
+    base_url, state = fake_llama_server
+    _patch_config(monkeypatch, base_url=base_url)
+    _patch_static_prompt(monkeypatch)
+    monkeypatch.setattr(
+        "agent.static_system_prompt.resolve_static_prompt_tools",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    result = priming.prime_static_system_prompt(health_timeout_seconds=5, request_timeout_seconds=5)
+    assert result.succeeded is True
+    assert state.seen_tools == [None]
+
+
+def test_priming_resolves_tools_for_the_primed_platform(monkeypatch, fake_llama_server):
+    base_url, state = fake_llama_server
+    _patch_config(monkeypatch, base_url=base_url)
+    _patch_static_prompt(monkeypatch)
+    seen_platforms = []
+
+    def _fake_resolve(*, platform, **_):
+        seen_platforms.append(platform)
+        return []
+
+    monkeypatch.setattr("agent.static_system_prompt.resolve_static_prompt_tools", _fake_resolve)
+    priming.prime_static_system_prompt(
+        health_timeout_seconds=5, request_timeout_seconds=5, platform="telegram",
+    )
+    assert seen_platforms == ["telegram"]
 
 
 # ── Health-wait behavior ──────────────────────────────────────────────

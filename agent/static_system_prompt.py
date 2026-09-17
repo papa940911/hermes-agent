@@ -44,18 +44,26 @@ __all__ = [
     "build_static_system_prompt",
     "build_primed_prefix_with_skills",
     "resolve_static_prompt_tool_names",
+    "resolve_static_prompt_tools",
 ]
 
 
-def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) -> frozenset:
-    """The real tool-name set a fresh agent on *platform* would load, read-only.
+def _resolve_static_prompt_tool_defs(*, platform: str, quiet_mode: bool = True) -> list:
+    """The real tool schema list a fresh agent on *platform* would load, read-only.
 
     Mirrors ``gateway.run.HermesGateway._resolve_enabled_toolsets_for_source``'s
     toolset resolution (platform_toolsets config -> ``_get_platform_tools``)
     followed by the exact ``agent_init.init_agent`` call
     (``model_tools.get_tool_definitions``) that turns a toolset list into
     concrete tool schemas, filtered by each tool's own availability check_fn.
-    No tool is invoked; only schemas/check_fns are read.
+    No tool is invoked; only schemas/check_fns are read. Shared by
+    :func:`resolve_static_prompt_tool_names` (names only) and
+    :func:`resolve_static_prompt_tools` (full schemas, needed so priming's
+    request matches the real ``tools=[...]`` a live turn sends — see Gate
+    CS9 in the cold-start report: the chat template renders a ``# Tools``
+    preamble ahead of the system message whenever ``tools`` is non-empty,
+    so priming without it can never share a KV-cache prefix with a real
+    turn regardless of how well the system-prompt text itself matches).
     """
     try:
         from hermes_cli.config import load_config_readonly
@@ -67,15 +75,30 @@ def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) 
         enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
         agent_cfg = cfg.get("agent") or {}
         disabled_toolsets = parse_config_string_list(agent_cfg.get("disabled_toolsets")) or None
-        tools = get_tool_definitions(
+        return get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=quiet_mode,
         )
-        return frozenset(t["function"]["name"] for t in tools if isinstance(t, dict))
     except Exception:
-        logger.debug("static system prompt: tool-name resolution failed", exc_info=True)
-        return frozenset()
+        logger.debug("static system prompt: tool resolution failed", exc_info=True)
+        return []
+
+
+def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) -> frozenset:
+    """The real tool-name set a fresh agent on *platform* would load, read-only.
+
+    See :func:`_resolve_static_prompt_tool_defs` for the underlying resolution.
+    """
+    tools = _resolve_static_prompt_tool_defs(platform=platform, quiet_mode=quiet_mode)
+    return frozenset(t["function"]["name"] for t in tools if isinstance(t, dict))
+
+
+def resolve_static_prompt_tools(*, platform: str, quiet_mode: bool = True) -> list:
+    """The real tool schema list (full JSON, not just names) a fresh agent on
+    *platform* would load, read-only. See :func:`_resolve_static_prompt_tool_defs`.
+    """
+    return _resolve_static_prompt_tool_defs(platform=platform, quiet_mode=quiet_mode)
 
 
 def _static_prompt_agent_view(

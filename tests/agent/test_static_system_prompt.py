@@ -482,3 +482,45 @@ class TestSafety:
             lambda: (_ for _ in ()).throw(RuntimeError("disk error")),
         )
         assert ssp.resolve_static_prompt_tool_names(platform="telegram") == frozenset()
+
+    def test_tool_schema_resolution_never_raises(self, monkeypatch):
+        """Gate CS9: resolve_static_prompt_tools shares the same safety
+        boundary as resolve_static_prompt_tool_names — a config-load failure
+        degrades to no tools rather than propagating."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: (_ for _ in ()).throw(RuntimeError("disk error")),
+        )
+        assert ssp.resolve_static_prompt_tools(platform="telegram") == []
+
+
+class TestToolSchemaResolution:
+    """Gate CS9 (cold-start report): resolve_static_prompt_tools must return
+    the SAME full tool schema list resolve_static_prompt_tool_names derives
+    its names from, since priming needs the full JSON (not just names) to
+    match what a real turn's ``tools=[...]`` request renders."""
+
+    def test_tool_schemas_names_match_tool_names_resolution(self, monkeypatch):
+        _patch_config(monkeypatch)
+        names_from_names_fn = ssp.resolve_static_prompt_tool_names(platform="telegram")
+        schemas = ssp.resolve_static_prompt_tools(platform="telegram")
+        names_from_schemas = frozenset(
+            t["function"]["name"] for t in schemas if isinstance(t, dict)
+        )
+        assert names_from_schemas == names_from_names_fn
+
+    def test_tool_schemas_are_full_dicts_not_just_names(self, monkeypatch):
+        _patch_config(monkeypatch)
+        schemas = ssp.resolve_static_prompt_tools(platform="telegram")
+        assert schemas, "expected at least one tool for the telegram platform"
+        for tool in schemas:
+            assert isinstance(tool, dict)
+            assert "function" in tool
+            assert "name" in tool["function"]
+
+    def test_empty_platform_toolset_returns_empty_list(self, monkeypatch):
+        _patch_config(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools", lambda cfg, platform: set(),
+        )
+        assert ssp.resolve_static_prompt_tools(platform="telegram") == []

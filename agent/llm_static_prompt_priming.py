@@ -39,6 +39,25 @@ but does not guarantee the first real request is a cache hit — see the
 Gate 10P report for measured eviction risk and the recommended follow-up
 (a separate, measured evaluation of ``--parallel 2`` / two KV slots).
 
+Gate CS9 (cold-start report, ``/tmp/hermes-cold-start-root-cause-report.txt``):
+Gates 10O-10S all primed the system-prompt TEXT but never passed ``tools``
+on the priming POST. A real turn always sends ``tools=agent.tools or None``
+(``run_agent.py``'s ``self.tools`` — currently ~18 schemas, ~11k tokens as
+JSON for the telegram platform), and llama.cpp's Qwen chat template renders
+a whole extra ``<|im_start|>system\n# Tools...`` block *ahead of* the
+caller-supplied system message whenever ``tools`` is non-empty. That means
+the rendered token sequence priming produced NEVER shared a cache prefix
+with any real tool-using turn, no matter how well the system-prompt text
+itself matched — every real first turn silently paid full prefill for the
+entire prompt (tools block included), live-measured at ~290s on this
+hardware, while priming's own reported "success" (fast, high cache_n)
+never reflected that miss. This module now also resolves and sends the
+real tool schema list (:func:`agent.static_system_prompt.resolve_static_prompt_tools`)
+so the primed KV-cache prefix actually matches what a real first turn
+renders. Live-measured fix: the same real request dropped from ~290s
+(cold, tools-only mismatch) to ~1.5s (cache_n covering the full tools +
+system + skills prefix, only the trailing per-turn tokens novel).
+
 Gate 10S: ``gateway.run.start_gateway`` used to ALSO schedule Gate 10O's
 generic backend warmup (``agent.llm_backend_warmup.schedule_startup_
 warmup``) immediately before this module's own ``schedule_startup_
@@ -203,21 +222,35 @@ def _wait_for_health(
 
 
 def _post_priming_completion(
-    base_url: str, api_key: str, model: str, system_prompt: str, timeout: float
+    base_url: str, api_key: str, model: str, system_prompt: str, timeout: float,
+    tools: Optional[list] = None,
 ) -> dict:
     url = f"{base_url}/chat/completions"
-    payload = json.dumps(
-        {
-            "model": model or "default",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": _PRIMING_USER_MESSAGE},
-            ],
-            "max_tokens": 1,
-            "temperature": 0,
-            "stream": False,
-        }
-    ).encode("utf-8")
+    body: dict = {
+        "model": model or "default",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": _PRIMING_USER_MESSAGE},
+        ],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": False,
+    }
+    # Gate CS9: a real turn sends ``tools=agent.tools or None`` (never an
+    # empty list) alongside the system prompt. Chat templates that support
+    # tool-calling (e.g. Qwen's) render a "# Tools" preamble as its OWN
+    # leading system block whenever ``tools`` is non-empty/non-null —
+    # ahead of the actual system message — so the rendered token sequence
+    # for a tools-bearing request shares almost no prefix with one primed
+    # without tools, regardless of how well the system-prompt TEXT matches.
+    # Omitting this (as prior gates did) made priming's KV-cache warm-up
+    # invisible to every real tool-using turn: measured live, an otherwise
+    # cache-hit-ready request costs ~290s instead of ~1.5s when only the
+    # ``tools`` field differs (see the Gate CS cold-start report). Matching
+    # that shape here is what makes the primed prefix reusable at all.
+    if tools:
+        body["tools"] = tools
+    payload = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=payload,
@@ -287,6 +320,18 @@ def prime_static_system_prompt(
             reason="prompt_build_failed",
         )
 
+    # Gate CS9: resolve the SAME tool schema list a real turn on *platform*
+    # would send. Best-effort — a resolution failure must not sacrifice the
+    # system-prompt priming that already worked; it only forfeits the
+    # tools-preamble cache-hit benefit for this one attempt.
+    try:
+        from agent.static_system_prompt import resolve_static_prompt_tools
+
+        priming_tools = resolve_static_prompt_tools(platform=platform)
+    except Exception:
+        logger.debug("static-prompt priming: tool resolution failed", exc_info=True)
+        priming_tools = []
+
     if not static_prompt:
         elapsed_ms = int(round((time.monotonic() - started) * 1000))
         return PrimingResult(
@@ -301,6 +346,7 @@ def prime_static_system_prompt(
             body = _post_priming_completion(
                 backend["base_url"], backend["api_key"], backend["model"],
                 static_prompt, request_timeout_seconds,
+                tools=priming_tools,
             )
             elapsed_ms = int(round((time.monotonic() - started) * 1000))
             timings = body.get("timings") if isinstance(body, dict) else None
@@ -317,9 +363,10 @@ def prime_static_system_prompt(
                     cached_tokens = details.get("cached_tokens")
             logger.info(
                 "static-prompt priming succeeded: attempt=%d elapsed_ms=%d "
-                "prompt_chars=%d prompt_tokens=%s cached_tokens=%s skills_fingerprint=%s endpoint_host=%s",
+                "prompt_chars=%d prompt_tokens=%s cached_tokens=%s tool_count=%d "
+                "skills_fingerprint=%s endpoint_host=%s",
                 attempt, elapsed_ms, len(static_prompt), prompt_tokens, cached_tokens,
-                skills_fingerprint or "-",
+                len(priming_tools), skills_fingerprint or "-",
                 urlparse(backend["base_url"]).hostname,
             )
             return PrimingResult(
