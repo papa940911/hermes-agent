@@ -605,3 +605,146 @@ def test_nested_integration_thin_no_promotion_call():
     source = Path(__file__).parents[2] / "plugins" / "platforms" / "telegram" / "adapter.py"
     text = source.read_text(encoding="utf-8")
     assert "watch_review_promote" not in text
+
+
+# ===========================================================================
+# Gate 10U.1: bridge module-reload / staleness-detection regression
+#
+# Root cause of the live "promote approved updates" routing bug: this
+# bridge cached the outer-repo telegram_review_router.py module (and, via
+# _get_router, a ReviewRouter instance built from it) for the entire
+# gateway process's lifetime with no staleness check at all. Once loaded
+# once, an outer-repo command-grammar change (e.g. adding a new exact-
+# match command) never took effect for an already-running gateway
+# process. These tests exercise the real bowling_review_bridge module
+# (not a fake) against the real outer-repo scripts directory, since the
+# whole point is proving the reload mechanism itself works.
+# ===========================================================================
+
+import importlib
+import os
+import time
+
+
+def _reset_bridge_module_state():
+    """Import (or re-import) the real bridge and clear its module-level
+    cache globals so each test starts from a clean slate, independent of
+    whatever earlier tests/imports in this process already did."""
+    from plugins.platforms.telegram import bowling_review_bridge
+    bowling_review_bridge._router_module = None
+    bowling_review_bridge._router_instance = None
+    bowling_review_bridge._router_signature = None
+    return bowling_review_bridge
+
+
+def test_bridge_loads_router_module_on_first_use():
+    bridge = _reset_bridge_module_state()
+    module = bridge._load_router_module()
+    assert module is not None
+    assert hasattr(module, "is_review_command")
+
+
+def test_bridge_reuses_module_when_nothing_changed():
+    bridge = _reset_bridge_module_state()
+    first = bridge._load_router_module()
+    second = bridge._load_router_module()
+    assert first is second  # no wasted reload when the source is unchanged
+
+
+def test_bridge_reloads_when_router_file_mtime_changes():
+    """The actual regression: bump telegram_review_router.py's mtime (as
+    a real edit/checkout would) and confirm the NEXT call gets a freshly
+    reloaded module object -- never the stale cached one -- with no
+    gateway restart involved."""
+    bridge = _reset_bridge_module_state()
+    first = bridge._load_router_module()
+    original_stat = bridge._ROUTER_PATH.stat()
+    try:
+        # Simulate a real future edit landing on disk.
+        os.utime(bridge._ROUTER_PATH, (original_stat.st_atime, original_stat.st_mtime + 5))
+        second = bridge._load_router_module()
+        assert second is not first
+    finally:
+        os.utime(bridge._ROUTER_PATH, (original_stat.st_atime, original_stat.st_mtime))
+
+
+def test_bridge_reloads_when_a_sibling_file_changes():
+    """The precise failure mode from the live incident: a change to a
+    file telegram_review_router.py transitively loads (not the router
+    file itself) must ALSO trigger a reload -- this is why the staleness
+    key covers the whole scripts directory, not just _ROUTER_PATH alone."""
+    bridge = _reset_bridge_module_state()
+    first = bridge._load_router_module()
+    sibling = bridge._ROUTER_SCRIPTS_DIR / "telegram_review_service.py"
+    original_stat = sibling.stat()
+    try:
+        os.utime(sibling, (original_stat.st_atime, original_stat.st_mtime + 5))
+        second = bridge._load_router_module()
+        assert second is not first
+    finally:
+        os.utime(sibling, (original_stat.st_atime, original_stat.st_mtime))
+
+
+def test_bridge_resets_router_instance_on_reload():
+    bridge = _reset_bridge_module_state()
+    first_instance = bridge._get_router()
+    original_stat = bridge._ROUTER_PATH.stat()
+    try:
+        os.utime(bridge._ROUTER_PATH, (original_stat.st_atime, original_stat.st_mtime + 5))
+        bridge._load_router_module()
+        assert bridge._router_instance is None
+        second_instance = bridge._get_router()
+        assert second_instance is not first_instance
+    finally:
+        os.utime(bridge._ROUTER_PATH, (original_stat.st_atime, original_stat.st_mtime))
+
+
+def test_bridge_reload_picks_up_a_new_command_alias(tmp_path, monkeypatch):
+    """End-to-end proof of the actual bug class: a command that is NOT
+    recognized before a (simulated) outer-repo edit becomes recognized
+    immediately after, with no restart -- reproducing exactly what should
+    have happened live for "promote approved updates"."""
+    import shutil
+
+    bridge = _reset_bridge_module_state()
+    fake_scripts = tmp_path / "scripts"
+    shutil.copytree(bridge._ROUTER_SCRIPTS_DIR, fake_scripts)
+    monkeypatch.setattr(bridge, "_ROUTER_SCRIPTS_DIR", fake_scripts)
+    monkeypatch.setattr(bridge, "_ROUTER_PATH", fake_scripts / "telegram_review_router.py")
+
+    router_source = bridge._ROUTER_PATH.read_text(encoding="utf-8")
+    assert '"totally new test command"' not in router_source
+    assert bridge.is_review_command("totally new test command") is False
+
+    patched = router_source.replace(
+        '"promote approved updates": "promotion_start",',
+        '"totally new test command": "status", "promote approved updates": "promotion_start",',
+        1,
+    )
+    assert patched != router_source
+    bridge._ROUTER_PATH.write_text(patched, encoding="utf-8")
+    # Force the new mtime forward in case the filesystem clock has coarse
+    # (e.g. 1s) resolution and the edit landed in the same tick.
+    st = bridge._ROUTER_PATH.stat()
+    os.utime(bridge._ROUTER_PATH, (st.st_atime, st.st_mtime + 5))
+
+    assert bridge.is_review_command("totally new test command") is True
+
+
+def test_bridge_missing_router_file_raises_bridge_error(tmp_path, monkeypatch):
+    bridge = _reset_bridge_module_state()
+    monkeypatch.setattr(bridge, "_ROUTER_SCRIPTS_DIR", tmp_path)
+    monkeypatch.setattr(bridge, "_ROUTER_PATH", tmp_path / "telegram_review_router.py")
+    with pytest.raises(bridge.BowlingReviewBridgeError):
+        bridge._load_router_module()
+
+
+def test_bridge_signature_empty_when_scripts_dir_missing(tmp_path, monkeypatch):
+    # pathlib's glob() silently yields nothing for a missing directory
+    # (no OSError) -- the empty-tuple signature still makes
+    # _load_router_module() fail closed via its separate is_file() check
+    # (see test_bridge_missing_router_file_raises_bridge_error) rather
+    # than via this function raising.
+    bridge = _reset_bridge_module_state()
+    monkeypatch.setattr(bridge, "_ROUTER_SCRIPTS_DIR", tmp_path / "does-not-exist")
+    assert bridge._dependency_closure_signature() == ()
