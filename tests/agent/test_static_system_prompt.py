@@ -524,3 +524,164 @@ class TestToolSchemaResolution:
             "hermes_cli.tools_config._get_platform_tools", lambda cfg, platform: set(),
         )
         assert ssp.resolve_static_prompt_tools(platform="telegram") == []
+
+
+# ── Gate CS10.1: memory-provider tools folded into the EFFECTIVE tool list ─
+#
+# Root cause: a real AIAgent's tool surface is base tools PLUS whatever the
+# configured external memory provider contributes (agent_init.py's
+# inject_memory_provider_tools). resolve_static_prompt_tools previously
+# mirrored only the base half, so priming's `tools` array was silently
+# shorter than a live turn's -- and since the Qwen chat template renders the
+# full tools block ahead of the system-prompt content, that alone was enough
+# to invalidate a large fraction of an otherwise byte-identical cached
+# prefix (production f_sim_best=0.587; see
+# /tmp/hermes_cs10_prefix_divergence_report.txt).
+
+
+def _patch_memory_provider(monkeypatch, *, provider_name="", schemas=None):
+    """Patch config + agent.memory_manager.resolve_configured_memory_provider_tool_schemas
+    the way ssp._resolve_static_prompt_effective_tool_defs actually calls it
+    (as OpenAI-wrapped entries), without touching real plugin discovery."""
+    base_cfg = {
+        "model": {"default": "test-model", "provider": "custom", "base_url": "http://127.0.0.1:8087/v1"},
+        "memory": {"memory_enabled": True, "user_profile_enabled": True, "provider": provider_name},
+        "agent": {},
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: base_cfg)
+    wrapped = [{"type": "function", "function": s} for s in (schemas or [])]
+
+    def _fake_resolver(**kwargs):
+        if not provider_name:
+            return []
+        return [w for w in wrapped if w["function"]["name"] not in (kwargs.get("existing_tool_names") or set())]
+
+    monkeypatch.setattr(
+        "agent.memory_manager.resolve_configured_memory_provider_tool_schemas", _fake_resolver,
+    )
+
+
+class TestMemoryProviderToolInclusion:
+    """Requirement A: memory-provider tools are included in static priming
+    resolution."""
+
+    def test_configured_provider_tools_appended_to_effective_list(self, monkeypatch):
+        monkeypatch.setattr(
+            ssp, "_resolve_static_prompt_tool_defs",
+            lambda **_: [{"type": "function", "function": {"name": "terminal"}}],
+        )
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        tools = ssp.resolve_static_prompt_tools(platform="telegram")
+        names = [t["function"]["name"] for t in tools]
+        assert names == ["terminal", "recall_thing"]  # base first, memory-provider after
+
+    def test_tool_names_also_include_memory_provider_names(self, monkeypatch):
+        """valid_tool_names (which gates some STABLE-tier guidance text
+        itself) must stay in sync with the tools array, not just names
+        resolve_static_prompt_tools happens to send."""
+        monkeypatch.setattr(
+            ssp, "_resolve_static_prompt_tool_defs",
+            lambda **_: [{"type": "function", "function": {"name": "terminal"}}],
+        )
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        names = ssp.resolve_static_prompt_tool_names(platform="telegram")
+        assert names == frozenset({"terminal", "recall_thing"})
+
+    def test_no_provider_configured_leaves_base_list_unchanged(self, monkeypatch):
+        monkeypatch.setattr(
+            ssp, "_resolve_static_prompt_tool_defs",
+            lambda **_: [{"type": "function", "function": {"name": "terminal"}}],
+        )
+        _patch_memory_provider(monkeypatch, provider_name="")
+        tools = ssp.resolve_static_prompt_tools(platform="telegram")
+        assert [t["function"]["name"] for t in tools] == ["terminal"]
+
+    def test_memory_provider_resolution_failure_degrades_to_base_only(self, monkeypatch):
+        monkeypatch.setattr(
+            ssp, "_resolve_static_prompt_tool_defs",
+            lambda **_: [{"type": "function", "function": {"name": "terminal"}}],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: (_ for _ in ()).throw(RuntimeError("disk error")),
+        )
+        tools = ssp.resolve_static_prompt_tools(platform="telegram")
+        assert [t["function"]["name"] for t in tools] == ["terminal"]
+
+    def test_base_toolset_drift_still_reflected_alongside_memory_provider(self, monkeypatch):
+        """Requirement G: base-tool availability drift keeps working when a
+        memory provider is ALSO configured -- the two resolutions are
+        independent and additive, neither masks the other."""
+        calls = {"n": 0}
+
+        def _base(**_):
+            calls["n"] += 1
+            # First call: tool available. Second call: check_fn now says no.
+            return [{"type": "function", "function": {"name": "homeassistant_call"}}] if calls["n"] == 1 else []
+
+        monkeypatch.setattr(ssp, "_resolve_static_prompt_tool_defs", _base)
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        first = [t["function"]["name"] for t in ssp.resolve_static_prompt_tools(platform="telegram")]
+        second = [t["function"]["name"] for t in ssp.resolve_static_prompt_tools(platform="telegram")]
+        assert first == ["homeassistant_call", "recall_thing"]
+        assert second == ["recall_thing"]  # base tool dropped, memory-provider tool unaffected
+
+    def test_deterministic_repeated_resolution(self, monkeypatch):
+        """Requirement I: byte-identical serialization across repeated calls
+        when configuration is unchanged."""
+        import json
+
+        monkeypatch.setattr(
+            ssp, "_resolve_static_prompt_tool_defs",
+            lambda **_: [{"type": "function", "function": {"name": "terminal"}}],
+        )
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {"a": 1}}],
+        )
+        first = ssp.resolve_static_prompt_tools(platform="telegram")
+        second = ssp.resolve_static_prompt_tools(platform="telegram")
+        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+
+class TestVolatileTailStillExcludesMemoryProviderContent:
+    """Requirement H: a configured memory provider's TOOLS get folded into
+    the tools array (above), but its system-prompt CONTENT (facts, recall
+    context) must remain excluded from the static/primed system TEXT -- that
+    stays in the volatile tail, built fresh per-turn, never primed."""
+
+    def test_static_prompt_text_excludes_provider_system_prompt_block(self, monkeypatch):
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        _patch_tool_names(monkeypatch, ("memory",))
+        patches = _quiet_builders()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            prompt = ssp.build_static_system_prompt(platform="telegram")
+        # The duck-typed view hard-codes _memory_manager=None, so no
+        # provider system_prompt_block() content can leak in even though
+        # the tools list now knows about the provider.
+        assert "fake-provider" not in prompt
+        assert "recall_thing" not in prompt  # tool NAME belongs in tools=[], not prompt text
+
+    def test_primed_prefix_with_skills_also_excludes_provider_content(self, monkeypatch):
+        _patch_memory_provider(
+            monkeypatch, provider_name="fake-provider",
+            schemas=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        _patch_tool_names(monkeypatch, ("memory",))
+        patches = _quiet_builders()
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            prefix, _fp = ssp.build_primed_prefix_with_skills(platform="telegram")
+        assert "fake-provider" not in prefix
+        assert "recall_thing" not in prefix

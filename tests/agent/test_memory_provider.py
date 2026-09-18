@@ -1382,3 +1382,241 @@ class TestTrivialPromptClassifier:
                   "hello world", "ok so what's next", "what's my name",
                   "hey can you check the logs", "continue the migration plan"):
             assert not is_trivial_prompt(t), f"expected non-trivial: {t!r}"
+
+
+# ---------------------------------------------------------------------------
+# Gate CS10.1: resolve_configured_memory_provider_tool_schemas
+#
+# Side-effect-free, provider-agnostic resolution of the configured memory
+# provider's tool schemas, for callers (CS10 static priming) with no live
+# AIAgent/MemoryManager. Root cause: priming's tools array previously
+# omitted these, so it was shorter than a live turn's -- and since the Qwen
+# chat template renders the tools block ahead of the system prompt, that
+# length mismatch alone invalidated a large fraction of an otherwise
+# byte-identical cached prefix (production f_sim_best=0.587; see
+# /tmp/hermes_cs10_prefix_divergence_report.txt).
+# ---------------------------------------------------------------------------
+
+
+def _patch_memory_provider_config(monkeypatch, *, provider_name):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"memory": {"provider": provider_name}} if provider_name else {"memory": {}},
+    )
+
+
+def _patch_load_memory_provider(monkeypatch, provider):
+    """Patch plugins.memory.load_memory_provider as imported LAZILY inside
+    agent.memory_manager.resolve_configured_memory_provider_tool_schemas."""
+    calls = []
+
+    def _fake_load(name, **kwargs):
+        calls.append((name, kwargs))
+        return provider
+
+    monkeypatch.setattr("plugins.memory.load_memory_provider", _fake_load)
+    return calls
+
+
+class TestResolveConfiguredMemoryProviderToolSchemas:
+    """Requirement C: provider-agnostic -- configured provider with schemas
+    is included, no provider adds nothing, disabled adds nothing."""
+
+    def test_no_provider_configured_returns_empty(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="")
+        assert resolve_configured_memory_provider_tool_schemas() == []
+
+    def test_configured_provider_with_schemas_is_included(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider(
+            "some-provider",
+            tools=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        schemas = resolve_configured_memory_provider_tool_schemas()
+        assert len(schemas) == 1
+        assert schemas[0] == {
+            "type": "function",
+            "function": {"name": "recall_thing", "description": "d", "parameters": {}},
+        }
+
+    def test_generic_not_hardcoded_to_any_specific_provider_name(self, monkeypatch):
+        """Must not special-case 'holographic' or any other provider name --
+        an arbitrarily-named provider's schemas are resolved the same way."""
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider(
+            "totally-unrelated-provider-xyz",
+            tools=[{"name": "whatever_tool", "description": "d", "parameters": {}}],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="totally-unrelated-provider-xyz")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        schemas = resolve_configured_memory_provider_tool_schemas()
+        assert {s["function"]["name"] for s in schemas} == {"whatever_tool"}
+
+    def test_provider_not_found_returns_empty(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="nonexistent")
+        _patch_load_memory_provider(monkeypatch, None)
+        assert resolve_configured_memory_provider_tool_schemas() == []
+
+    def test_unavailable_provider_returns_empty(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider("unavail", available=False, tools=[{"name": "x"}])
+        _patch_memory_provider_config(monkeypatch, provider_name="unavail")
+        _patch_load_memory_provider(monkeypatch, provider)
+        assert resolve_configured_memory_provider_tool_schemas() == []
+
+    def test_disabled_via_disabled_toolsets_returns_empty(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider(
+            "some-provider", tools=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        calls = _patch_load_memory_provider(monkeypatch, provider)
+
+        schemas = resolve_configured_memory_provider_tool_schemas(
+            enabled_toolsets=["memory"], disabled_toolsets=["memory"],
+        )
+        assert schemas == []
+        # Gated off before ever constructing the provider -- no wasted work,
+        # and no chance of a disabled provider's __init__ running anyway.
+        assert calls == []
+
+    def test_existing_tool_names_deduplicated(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider(
+            "some-provider",
+            tools=[
+                {"name": "memory", "description": "collides with a base tool", "parameters": {}},
+                {"name": "recall_thing", "description": "d", "parameters": {}},
+            ],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        schemas = resolve_configured_memory_provider_tool_schemas(
+            existing_tool_names={"memory"},
+        )
+        assert {s["function"]["name"] for s in schemas} == {"recall_thing"}
+
+    def test_malformed_schema_skipped_not_poisoned(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        provider = FakeMemoryProvider(
+            "some-provider",
+            tools=[{"description": "no name at all"}, {"name": "good_one"}],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        schemas = resolve_configured_memory_provider_tool_schemas()
+        assert {s["function"]["name"] for s in schemas} == {"good_one"}
+
+    def test_never_raises_on_provider_load_exception(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="boom-provider")
+
+        def _raise(name, **kwargs):
+            raise RuntimeError("plugin load exploded")
+
+        monkeypatch.setattr("plugins.memory.load_memory_provider", _raise)
+        assert resolve_configured_memory_provider_tool_schemas() == []
+
+    def test_never_raises_on_config_load_failure(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: (_ for _ in ()).throw(RuntimeError("disk error")),
+        )
+        assert resolve_configured_memory_provider_tool_schemas() == []
+
+    # -- Requirement D: no side effects --------------------------------------
+
+    def test_does_not_call_initialize(self, monkeypatch):
+        provider = FakeMemoryProvider(
+            "some-provider", tools=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        resolve_configured_memory_provider_tool_schemas()
+        assert provider.initialized is False
+
+    def test_requests_no_skill_registration(self, monkeypatch):
+        """register_skills=False must be passed explicitly -- this path must
+        never mutate the skill registry as a side effect of reading schemas."""
+        provider = FakeMemoryProvider(
+            "some-provider", tools=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        calls = _patch_load_memory_provider(monkeypatch, provider)
+
+        resolve_configured_memory_provider_tool_schemas()
+        assert calls == [("some-provider", {"register_skills": False})]
+
+    def test_does_not_touch_prefetch_sync_or_write_paths(self, monkeypatch):
+        provider = FakeMemoryProvider(
+            "some-provider", tools=[{"name": "recall_thing", "description": "d", "parameters": {}}],
+        )
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        resolve_configured_memory_provider_tool_schemas()
+        assert provider.prefetch_queries == []
+        assert provider.queued_prefetches == []
+        assert provider.synced_turns == []
+        assert provider.memory_writes == []
+
+    # -- Requirement I: deterministic -----------------------------------------
+
+    def test_deterministic_repeated_resolution(self, monkeypatch):
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+        import json
+
+        provider = FakeMemoryProvider(
+            "some-provider",
+            tools=[{"name": "recall_thing", "description": "d", "parameters": {"a": 1}}],
+        )
+        _patch_memory_provider_config(monkeypatch, provider_name="some-provider")
+        _patch_load_memory_provider(monkeypatch, provider)
+
+        first = resolve_configured_memory_provider_tool_schemas()
+        second = resolve_configured_memory_provider_tool_schemas()
+        assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
+
+    # -- Shared normalization with the live inject_memory_provider_tools ----
+
+    def test_shares_normalization_with_live_injection_path(self):
+        """Requirement B: the same raw schema, run through each path's
+        normalization, must yield the same effective schema -- one source
+        of truth for what makes a memory-provider schema valid to send."""
+        from agent.memory_manager import _normalized_memory_tool_schemas
+
+        raw = [
+            {"name": "recall_thing", "description": "d", "parameters": {}},
+            {"description": "no name, must be dropped identically everywhere"},
+        ]
+        live_style = _normalized_memory_tool_schemas(raw)
+        static_style = _normalized_memory_tool_schemas(raw)
+        assert live_style == static_style == [
+            {"name": "recall_thing", "description": "d", "parameters": {}}
+        ]

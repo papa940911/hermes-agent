@@ -107,6 +107,46 @@ def memory_provider_tools_enabled(
         return False
 
 
+def _normalized_memory_tool_schemas(
+    raw_schemas: Any,
+    *,
+    existing_tool_names: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """Normalize a provider's raw ``get_tool_schemas()`` output into bare
+    function-schema dicts, skipping unresolvable-name entries (with a
+    warning, same as before) and anything already present in
+    *existing_tool_names* (if given).
+
+    Pure — no I/O, no provider access, no mutation of *existing_tool_names*
+    itself (a local copy is used for the dedup check). Factored out of
+    :func:`inject_memory_provider_tools` so the live-agent path and the
+    side-effect-free static/priming path (see
+    :func:`resolve_configured_memory_provider_tool_schemas`) apply IDENTICAL
+    normalization/dedup rules to whatever schemas each path's own provider
+    lookup returns — one source of truth for "what makes a memory-provider
+    schema valid to send", even though the two paths get their raw schemas
+    from different places (a live, already-initialized provider vs. a
+    freshly-constructed, never-initialized one).
+    """
+    seen = set(existing_tool_names) if existing_tool_names else set()
+    out: List[Dict[str, Any]] = []
+    for raw_schema in raw_schemas:
+        schema = normalize_tool_schema(raw_schema)
+        if schema is None:
+            logger.warning(
+                "Memory provider returned a tool schema with no resolvable "
+                "name; skipping to avoid poisoning the request (%r)",
+                raw_schema,
+            )
+            continue
+        name = schema["name"]
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(schema)
+    return out
+
+
 def inject_memory_provider_tools(agent: Any) -> int:
     """Append external memory-provider tool schemas to an agent tool surface."""
     memory_manager = getattr(agent, "_memory_manager", None)
@@ -136,24 +176,101 @@ def inject_memory_provider_tools(agent: Any) -> int:
         agent.valid_tool_names = valid_tool_names
 
     added = 0
-    for raw_schema in get_schemas():
-        schema = normalize_tool_schema(raw_schema)
-        if schema is None:
-            logger.warning(
-                "Memory provider returned a tool schema with no resolvable "
-                "name; skipping to avoid poisoning the request (%r)",
-                raw_schema,
-            )
-            continue
-        tool_name = schema["name"]
-        if tool_name in existing_tool_names:
-            continue
+    for schema in _normalized_memory_tool_schemas(
+        get_schemas(), existing_tool_names=existing_tool_names
+    ):
         tools.append({"type": "function", "function": schema})
-        valid_tool_names.add(tool_name)
-        existing_tool_names.add(tool_name)
+        valid_tool_names.add(schema["name"])
+        existing_tool_names.add(schema["name"])
         added += 1
 
     return added
+
+
+def resolve_configured_memory_provider_tool_schemas(
+    *,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    memory_tool_present: bool = False,
+    existing_tool_names: Optional[set] = None,
+) -> List[Dict[str, Any]]:
+    """The OpenAI-format tool entries the CONFIGURED external memory
+    provider would contribute to a real agent's ``tools`` array — read-only,
+    side-effect-free, provider-agnostic (Gate CS10.1).
+
+    This exists so a caller with no live ``AIAgent``/``MemoryManager`` (the
+    CS10 static-priming path, see
+    ``agent.static_system_prompt.resolve_static_prompt_tools``) can resolve
+    the SAME memory-provider tool set a real turn's
+    :func:`inject_memory_provider_tools` would add, instead of silently
+    omitting it — the omission previously meant priming's ``tools`` array
+    was shorter than a live turn's, and since the Qwen chat template renders
+    the full tools block ahead of the system-prompt content, that length
+    mismatch alone was enough to invalidate a large fraction of an otherwise
+    byte-identical cached prefix (see ``/tmp/hermes_cs10_prefix_divergence_
+    report.txt``).
+
+    Reads ``memory.provider`` from config and, if one is set, CONSTRUCTS
+    that provider (via :func:`plugins.memory.load_memory_provider`) only
+    far enough to call its ``get_tool_schemas()`` — never
+    ``initialize()``, never ``add_provider()``/``initialize_all()`` on a
+    :class:`MemoryManager`, never a tool call. Every ``MemoryProvider``'s
+    ``__init__`` is documented to be a cheap config read (connection/session
+    setup belongs in ``initialize()``), and ``get_tool_schemas()`` must
+    already be answerable before any connection exists — a real agent calls
+    it (via ``MemoryManager.get_all_tool_schemas``) to build the FIRST
+    turn's tool list, before any recall/write has happened. Skills
+    registration is explicitly suppressed (``register_skills=False``) so
+    this stays free of registry side effects regardless of which provider
+    is configured or whether it's the active one.
+
+    Returns ``[]`` (never raises) when: no provider is configured, the
+    configured provider can't be found/loaded, ``is_available()`` is False,
+    memory-provider tools are gated off by *enabled_toolsets*/
+    *disabled_toolsets*/*memory_tool_present* (see
+    :func:`memory_provider_tools_enabled` — same gate the live path uses),
+    or anything else goes wrong. Each returned entry is already wrapped as
+    ``{"type": "function", "function": {...}}``, matching the shape
+    ``model_tools.get_tool_definitions`` returns for base tools, so a caller
+    can simply concatenate the two lists to get the effective tools array in
+    the same order a live agent builds it (base tools first, memory-provider
+    tools appended after — mirrors ``agent/agent_init.py``'s injection
+    order, which matters because Qwen renders tool schemas positionally).
+    """
+    try:
+        if not memory_provider_tools_enabled(
+            enabled_toolsets, disabled_toolsets, memory_tool_present=memory_tool_present,
+        ):
+            return []
+
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        provider_name = str((cfg.get("memory") or {}).get("provider") or "").strip()
+        if not provider_name:
+            return []
+
+        from plugins.memory import load_memory_provider
+
+        provider = load_memory_provider(provider_name, register_skills=False)
+        if provider is None or not provider.is_available():
+            return []
+
+        get_schemas = getattr(provider, "get_tool_schemas", None)
+        if not callable(get_schemas):
+            return []
+
+        return [
+            {"type": "function", "function": schema}
+            for schema in _normalized_memory_tool_schemas(
+                get_schemas(), existing_tool_names=existing_tool_names
+            )
+        ]
+    except Exception:
+        logger.debug(
+            "resolve_configured_memory_provider_tool_schemas failed", exc_info=True
+        )
+        return []
 
 
 # ---------------------------------------------------------------------------

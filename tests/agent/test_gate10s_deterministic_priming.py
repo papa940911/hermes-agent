@@ -19,6 +19,17 @@ not by ordering — and adds a bounded, OPT-IN readiness primitive
 (`wait_for_priming_ready` / `get_last_priming_result`) for observability
 and any future caller that wants to avoid the much narrower remaining race
 (a genuine user message arriving before the one remaining prime finishes).
+
+Amended for Gate CS10: the "exactly one prime, ever, per process" property
+this file pins is now specifically about the STARTUP prime. CS10 adds a
+deliberate, narrow exception -- a re-prime triggered by detected backend-
+restart or tool-schema drift -- because a llama-server restart independent
+of the gateway can otherwise silently invalidate the KV cache for the rest
+of the process lifetime (see agent/llm_static_prompt_priming.py's Gate
+CS10 docstring section). ``TestOperational`` below was updated accordingly
+to allow the specific, existing-elsewhere periodic mechanism CS10 uses
+(``agent.periodic_scheduler``) while still forbidding a heavy external
+scheduling dependency or an actual subprocess/systemctl invocation.
 """
 
 from __future__ import annotations
@@ -832,17 +843,82 @@ class TestPerformance:
 
 
 class TestOperational:
-    def test_no_scheduler_or_cron_added(self):
+    def test_no_heavy_scheduling_dependency_added(self):
+        """Gate CS10 (deliberate, narrow exception to the original Gate 10S
+        "no scheduler" rule): re-priming a backend that can now restart
+        independently of the gateway requires SOME periodic re-check, so
+        CS10 registers one on ``agent.periodic_scheduler`` -- the existing
+        single shared-thread mechanism ``agent/turn_liveness.py`` and
+        ``agent/turn_facade_lease.py`` already use elsewhere in this
+        codebase, not a new dependency. What this test still guards against
+        is a HEAVY external scheduling dependency (a cron library, a
+        separate process, wall-clock cron syntax) -- none of which CS10
+        added."""
         source = inspect.getsource(priming)
-        for forbidden in ("croniter", "APScheduler", "schedule.every", "periodic"):
+        for forbidden in ("croniter", "APScheduler", "schedule.every", "import cron"):
             assert forbidden not in source
+        # The one sanctioned periodic mechanism is the shared in-process
+        # scheduler already used elsewhere -- not a bespoke one.
+        assert "agent.periodic_scheduler" in source
 
     def test_no_llama_config_or_slot_change_in_module(self):
-        """The module may document the single-slot constraint in prose, but
-        must never itself construct a command/config to change it."""
+        """The module must never construct or EXECUTE a command/config that
+        CHANGES backend process state (launch flags, service lifecycle
+        commands, etc).
+
+        Amended for the CS10 reliability refinement: the module now
+        legitimately reads (never changes) systemd state via a bounded,
+        ``shell=False`` ``subprocess.run(["systemctl", "show", ...])`` call
+        (:func:`agent.llm_static_prompt_priming._query_systemd_instance_
+        signature`) — a read-only ``show``, not a ``restart``/``stop``/
+        ``start``. So ``subprocess`` itself is no longer forbidden outright;
+        instead this asserts the read-only property directly: no
+        ``shell=True`` anywhere, and none of systemd's own MUTATING verbs
+        appear as a quoted subprocess argument."""
         source = inspect.getsource(priming)
-        for forbidden in ("subprocess", "systemctl", "ExecStart", "-ngl ", "-ub "):
+        for forbidden in ("ExecStart", "-ngl ", "-ub "):
             assert forbidden not in source
+        for mutating_verb in ("restart", "stop", "start", "kill", "reload"):
+            assert f'"{mutating_verb}"' not in source
+            assert f"'{mutating_verb}'" not in source
+        in_docstring = False
+        for line in source.splitlines():
+            stripped = line.strip()
+            if "systemctl" in line:
+                assert (
+                    in_docstring
+                    or stripped.startswith("#")
+                    or '"systemctl"' in line  # the one legitimate argv-list use
+                ), "systemctl referenced unexpectedly: " + line
+            if "shell=True" in line:
+                assert in_docstring or stripped.startswith("#"), (
+                    "shell=True used outside prose/comment: " + line
+                )
+            if (line.count('"""') + line.count("'''")) % 2 == 1:
+                in_docstring = not in_docstring
+
+    def test_systemd_query_never_uses_shell_true(self):
+        """Direct pin (complements the source-scan above): the actual
+        subprocess.run call in _query_systemd_instance_signature must pass
+        a plain argv list, never shell=True."""
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            import subprocess as _sp
+
+            return _sp.CompletedProcess(args, 0, stdout="")
+
+        import unittest.mock
+
+        with unittest.mock.patch.object(priming.subprocess, "run", fake_run):
+            priming._query_systemd_instance_signature("llama-vulkan.service", timeout=1)
+
+        assert len(calls) == 1
+        args, kwargs = calls[0]
+        assert isinstance(args, list)
+        assert kwargs.get("shell", False) is False
+        assert args[:2] == ["systemctl", "show"]
 
     def test_module_never_calls_git_push(self):
         source = inspect.getsource(priming)

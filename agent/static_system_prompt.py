@@ -1,4 +1,4 @@
-"""Side-effect-free construction of Hermes's real static system-prompt prefix (Gate 10P, extended Gate 10R).
+"""Side-effect-free construction of Hermes's real static system-prompt prefix (Gate 10P, extended Gate 10R, Gate CS10.1).
 
 ``agent.system_prompt.build_system_prompt_parts(agent)`` already splits Hermes's
 system prompt into three cache tiers (see that module's docstring): ``stable``
@@ -30,6 +30,27 @@ so the result reflects the live configuration without hand-duplicating it.
 
 Nothing here writes memory, persists a session, invokes a tool, or sends a
 message on any platform.
+
+Gate CS10.1 (memory-provider tools in the ``tools`` array): a real
+``AIAgent`` doesn't stop at ``get_tool_definitions()`` for its tool
+surface — ``agent_init.py`` also runs
+``agent.memory_manager.inject_memory_provider_tools`` for whatever
+``memory.provider`` is configured, appending that provider's own tool
+schemas (e.g. this deployment's ``holographic`` provider contributes
+``fact_store``/``fact_feedback``). Production validation found that
+priming's tools array omitted these, and because the Qwen chat template
+renders the full tools block AHEAD of the system-prompt content, that
+length mismatch alone invalidated a large fraction of an otherwise
+byte-identical cached prefix (``f_sim_best=0.587`` in production; see
+``/tmp/hermes_cs10_prefix_divergence_report.txt``). ``resolve_static_prompt_tools``/
+``resolve_static_prompt_tool_names`` now resolve this EFFECTIVE list (base
++ memory-provider tools) via
+:func:`agent.memory_manager.resolve_configured_memory_provider_tool_schemas`
+— side-effect-free and provider-agnostic (derives entirely from
+``memory.provider`` in config; never hardcodes a provider name or tool
+name). This does NOT extend to the volatile system-prompt tail (memory
+*content*, session ID, timestamp) — that remains intentionally unprimed;
+see :func:`build_primed_prefix_with_skills`'s docstring.
 """
 
 from __future__ import annotations
@@ -85,20 +106,86 @@ def _resolve_static_prompt_tool_defs(*, platform: str, quiet_mode: bool = True) 
         return []
 
 
-def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) -> frozenset:
-    """The real tool-name set a fresh agent on *platform* would load, read-only.
+def _resolve_static_prompt_effective_tool_defs(*, platform: str, quiet_mode: bool = True) -> list:
+    """Gate CS10.1: base tool defs PLUS whatever the CONFIGURED external
+    memory provider would contribute to a real agent's ``tools`` array.
 
-    See :func:`_resolve_static_prompt_tool_defs` for the underlying resolution.
+    A real ``AIAgent`` doesn't stop at ``get_tool_definitions()`` — after
+    base-tool resolution, ``agent_init.py`` also runs
+    ``agent.memory_manager.inject_memory_provider_tools`` for whatever
+    ``memory.provider`` is configured (e.g. this deployment's
+    ``holographic`` provider, which contributes ``fact_store`` and
+    ``fact_feedback``). ``_resolve_static_prompt_tool_defs`` alone only
+    mirrored the FIRST half of that, so priming's ``tools`` array was
+    silently shorter than a live turn's — and since the Qwen chat template
+    renders the full tools block ahead of the system-prompt content, that
+    length mismatch alone was enough to invalidate a large fraction of an
+    otherwise byte-identical cached prefix (confirmed in production; see
+    ``/tmp/hermes_cs10_prefix_divergence_report.txt``).
+
+    Memory-provider tools are resolved via
+    :func:`agent.memory_manager.resolve_configured_memory_provider_tool_schemas`
+    — side-effect-free (constructs the configured provider only far enough
+    to read its static ``get_tool_schemas()``; never initializes it, never
+    connects, never calls a tool) and provider-agnostic (derives entirely
+    from ``memory.provider`` in config; a different provider, or none,
+    "just works" without any change here). Appended AFTER the base tools,
+    matching ``agent_init.py``'s real injection order, since tool order is
+    itself part of what the chat template renders.
     """
-    tools = _resolve_static_prompt_tool_defs(platform=platform, quiet_mode=quiet_mode)
+    base_tools = _resolve_static_prompt_tool_defs(platform=platform, quiet_mode=quiet_mode)
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.tools_config import _get_platform_tools
+        from agent.skill_utils import parse_config_string_list
+        from agent.memory_manager import resolve_configured_memory_provider_tool_schemas
+
+        cfg = load_config_readonly() or {}
+        enabled_toolsets = sorted(_get_platform_tools(cfg, platform))
+        agent_cfg = cfg.get("agent") or {}
+        disabled_toolsets = parse_config_string_list(agent_cfg.get("disabled_toolsets")) or None
+        existing_tool_names = {
+            t["function"]["name"]
+            for t in base_tools
+            if isinstance(t, dict) and isinstance(t.get("function"), dict)
+        }
+        memory_tools = resolve_configured_memory_provider_tool_schemas(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            memory_tool_present="memory" in existing_tool_names,
+            existing_tool_names=existing_tool_names,
+        )
+    except Exception:
+        logger.debug(
+            "static system prompt: memory-provider tool resolution failed", exc_info=True
+        )
+        memory_tools = []
+    return base_tools + memory_tools
+
+
+def resolve_static_prompt_tool_names(*, platform: str, quiet_mode: bool = True) -> frozenset:
+    """The real EFFECTIVE tool-name set (base + configured memory-provider
+    tools) a fresh agent on *platform* would load, read-only.
+
+    See :func:`_resolve_static_prompt_effective_tool_defs` for the
+    underlying resolution. Kept in sync with :func:`resolve_static_prompt_tools`
+    so ``valid_tool_names`` in the primed view (which gates some of the
+    STABLE-tier guidance text itself, e.g. ``agent/system_prompt.py``'s
+    ``"memory" in agent.valid_tool_names`` checks) reflects the same tool
+    set a live turn would see — not just the ``tools`` array a request
+    sends.
+    """
+    tools = _resolve_static_prompt_effective_tool_defs(platform=platform, quiet_mode=quiet_mode)
     return frozenset(t["function"]["name"] for t in tools if isinstance(t, dict))
 
 
 def resolve_static_prompt_tools(*, platform: str, quiet_mode: bool = True) -> list:
-    """The real tool schema list (full JSON, not just names) a fresh agent on
-    *platform* would load, read-only. See :func:`_resolve_static_prompt_tool_defs`.
+    """The real EFFECTIVE tool schema list (full JSON, not just names) a
+    fresh agent on *platform* would load, read-only — base tools PLUS
+    whatever the configured external memory provider contributes. See
+    :func:`_resolve_static_prompt_effective_tool_defs`.
     """
-    return _resolve_static_prompt_tool_defs(platform=platform, quiet_mode=quiet_mode)
+    return _resolve_static_prompt_effective_tool_defs(platform=platform, quiet_mode=quiet_mode)
 
 
 def _static_prompt_agent_view(
