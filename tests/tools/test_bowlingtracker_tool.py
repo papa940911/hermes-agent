@@ -43,6 +43,9 @@ class FakeAdapter:
     def personal_summary(self, **arguments):
         return self._call("personal_summary", arguments)
 
+    def session_analysis(self, **arguments):
+        return self._call("session_analysis", arguments)
+
     def failure_result(self, error):
         return {
             "contractVersion": "personal-bowling-evidence/v1",
@@ -61,11 +64,12 @@ def reset_adapter():
     btt._adapter = None
 
 
-def test_three_tools_registered_under_distinct_toolset():
+def test_four_tools_registered_under_distinct_toolset():
     names = {
         "bowlingtracker_recent_sessions",
         "bowlingtracker_session_detail",
         "bowlingtracker_personal_summary",
+        "bowlingtracker_session_analysis",
     }
     assert set(registry.get_tool_names_for_toolset("bowlingtracker")) == names
     for name in names:
@@ -83,6 +87,7 @@ def test_tools_visible_together_in_model_schema():
         "bowlingtracker_recent_sessions",
         "bowlingtracker_session_detail",
         "bowlingtracker_personal_summary",
+        "bowlingtracker_session_analysis",
     }
 
 
@@ -192,3 +197,80 @@ def test_tool_module_is_provider_and_platform_independent():
     assert "anthropic" not in lowered
     assert "openai" not in lowered
     assert "telegram" not in lowered
+
+
+def test_session_analysis_schema_is_preferred_and_needs_no_uuid():
+    schema = registry.get_schema("bowlingtracker_session_analysis")
+    description = schema["description"]
+    assert description.startswith("PREFERRED tool")
+    for phrase in ("comparing two sessions", "why did I score lower", "never invent"):
+        assert phrase.casefold() in (description + json.dumps(schema)).casefold(), phrase
+    for phrase in ("causes", "better/worse"):
+        assert phrase in description
+    parameters = schema["parameters"]
+    assert "required" not in parameters
+    assert parameters["properties"]["question_focus"]["enum"] == [
+        "overview", "cause", "shot_or_frame", "game", "ball", "better_or_worse", "baseline",
+    ]
+    assert parameters["properties"]["game_number"]["minimum"] == 1
+    detail = registry.get_schema("bowlingtracker_session_detail")["description"]
+    assert "prefer bowlingtracker_session_analysis" in detail
+
+
+def test_session_analysis_dispatch_passes_only_declared_arguments(monkeypatch):
+    fake = FakeAdapter()
+    monkeypatch.setattr(btt, "_adapter", fake)
+    registry.dispatch(
+        "bowlingtracker_session_analysis",
+        {
+            "session_name": "Practice",
+            "compare_session_date": "2026-09-19",
+            "question_focus": "cause",
+            "get": "injected",
+            "url": "http://elsewhere",
+        },
+    )
+    assert fake.calls == [(
+        "session_analysis",
+        {
+            "user_question": None,
+            "session_name": "Practice",
+            "compare_session_date": "2026-09-19",
+            "question_focus": "cause",
+        },
+    )]
+
+
+def test_session_analysis_adapter_failure_uses_safe_envelope(monkeypatch):
+    fake = FakeAdapter(error=RuntimeError("secret details must not escape"))
+    monkeypatch.setattr(btt, "_adapter", fake)
+    result = json.loads(
+        registry.dispatch("bowlingtracker_session_analysis", {"session_name": "Practice"})
+    )
+    assert result["status"] == "unavailable"
+    assert "secret" not in json.dumps(result)
+
+
+def test_lower_level_tools_still_dispatch_to_their_operations(monkeypatch):
+    fake = FakeAdapter()
+    monkeypatch.setattr(btt, "_adapter", fake)
+    registry.dispatch("bowlingtracker_recent_sessions", {"limit": 2})
+    registry.dispatch("bowlingtracker_session_detail", {"session_id": "x"})
+    registry.dispatch("bowlingtracker_personal_summary", {"session_limit": 1})
+    assert [name for name, _ in fake.calls] == [
+        "recent_sessions", "session_detail", "personal_summary",
+    ]
+
+
+def test_session_analysis_receives_user_task_not_model_supplied_question(monkeypatch):
+    fake = FakeAdapter()
+    monkeypatch.setattr(btt, "_adapter", fake)
+    registry.dispatch(
+        "bowlingtracker_session_analysis",
+        {"question_focus": "baseline", "user_question": "model-invented text"},
+        user_task="Why did I score lower in Practice?",
+    )
+    assert fake.calls == [(
+        "session_analysis",
+        {"question_focus": "baseline", "user_question": "Why did I score lower in Practice?"},
+    )]

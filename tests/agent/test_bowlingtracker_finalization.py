@@ -73,3 +73,50 @@ def test_explicit_web_or_future_fusion_intent_stays_in_agent_loop():
         "bowlingtracker_personal_summary", result(), messages(fusion)
     ) is None
 
+
+def analysis_result(**overrides):
+    payload = {
+        "contractVersion": "personal-bowling-session-analysis/v1",
+        "status": "ok",
+        "dataSource": "BowlingTracker",
+        "answer": "Session: Practice. Linkage is session-only.",
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_session_analysis_answer_is_terminal_exactly_as_authored():
+    assert bowlingtracker_terminal_response(
+        "bowlingtracker_session_analysis", analysis_result(), messages("How did Practice go?")
+    ) == "Session: Practice. Linkage is session-only."
+
+
+def test_session_analysis_errors_and_ambiguity_are_terminal():
+    for status in ("error", "ambiguous", "not_found"):
+        assert bowlingtracker_terminal_response(
+            "bowlingtracker_session_analysis",
+            analysis_result(status=status, answer=f"{status} answer"),
+            messages("How did Practice go?"),
+        ) == f"{status} answer"
+
+
+def test_session_analysis_accepts_shared_failure_envelope():
+    assert bowlingtracker_terminal_response(
+        "bowlingtracker_session_analysis",
+        result(status="unavailable", answer="Personal BowlingTracker data is unavailable."),
+        messages("How did Practice go?"),
+    ) == "Personal BowlingTracker data is unavailable."
+
+
+def test_session_analysis_contract_is_not_accepted_for_other_tools():
+    assert bowlingtracker_terminal_response(
+        "bowlingtracker_personal_summary", analysis_result(), messages()
+    ) is None
+
+
+def test_session_analysis_still_yields_to_explicit_fusion_or_web_intent():
+    assert bowlingtracker_terminal_response(
+        "bowlingtracker_session_analysis",
+        analysis_result(),
+        messages("Given my BowlingTracker session, what would Mo Pinel say?"),
+    ) is None

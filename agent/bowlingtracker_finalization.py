@@ -22,8 +22,18 @@ BOWLINGTRACKER_TOOL_NAMES = frozenset(
         "bowlingtracker_recent_sessions",
         "bowlingtracker_session_detail",
         "bowlingtracker_personal_summary",
+        "bowlingtracker_session_analysis",
     }
 )
+PERSONAL_EVIDENCE_CONTRACT = "personal-bowling-evidence/v1"
+SESSION_ANALYSIS_CONTRACT = "personal-bowling-session-analysis/v1"
+# The session-analysis tool returns its own verified contract; adapter failures that
+# escape it still use the shared personal-evidence failure envelope.
+_ACCEPTED_CONTRACTS = {
+    "bowlingtracker_session_analysis": frozenset(
+        {SESSION_ANALYSIS_CONTRACT, PERSONAL_EVIDENCE_CONTRACT}
+    ),
+}
 
 _EXPERT_MARKERS = (
     "mo pinel",
@@ -68,7 +78,8 @@ def bowlingtracker_terminal_response(
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("contractVersion") != "personal-bowling-evidence/v1":
+    accepted = _ACCEPTED_CONTRACTS.get(tool_name, frozenset({PERSONAL_EVIDENCE_CONTRACT}))
+    if data.get("contractVersion") not in accepted:
         return None
     if data.get("dataSource") != "BowlingTracker":
         return None
